@@ -137,17 +137,33 @@ CONF="$STATE/$VM.conf"
 echo "$VM" > "$STATE/default"
 say "config: $CONF"
 
-# ---- 7. apps --------------------------------------------------------------------
+# ---- 7. host audio player ---------------------------------------------------
+# Guest has no sound hardware; `knulli-vm audio` streams the loopback card
+# over ssh into this CoreAudio sink (built with the Xcode CLT compiler).
+if [ ! -x "$HERE/bin/audioplay" ]; then
+    if command -v xcrun >/dev/null && xcrun --find swiftc >/dev/null 2>&1; then
+        say "building host audio player (bin/audioplay)"
+        mkdir -p "$HERE/bin"
+        xcrun swiftc -O -o "$HERE/bin/audioplay" "$HERE/lib/host/audioplay.swift" \
+            || say "WARNING: audioplay build failed — guest audio will be silent"
+    else
+        say "WARNING: no swiftc (xcode-select --install) — guest audio will be silent"
+    fi
+fi
+
+# ---- 8. apps --------------------------------------------------------------------
 for a in ${APPS[@]+"${APPS[@]}"}; do
     "$HERE/knulli-vm" --vm "$VM" app add "$a" --default || die "app add failed: $a"
 done
 
-# ---- 8. done ---------------------------------------------------------------------
+# ---- 9. done ---------------------------------------------------------------------
 echo
 echo "knulli-vm ready."
 if [ -d "$STATE/$VM.apps" ] && [ -n "$(ls -A "$STATE/$VM.apps" 2>/dev/null)" ]; then
-    echo "  ./knulli-vm start          # launch the default app"
+    echo "  ./knulli-vm start          # launch the default app (+ audio to Mac)"
     echo "  open \$(./knulli-vm vnc)   # VNC in (password: $VNC_PASS)"
+    echo "  keyboard on the VNC screen maps to the pad:"
+    echo "  WASD/arrows=dpad  JKUI=ABXY  QE=LR  Enter=Start  BackSpace=Select"
 else
     echo "  no apps yet — e.g.:"
     echo "  ./knulli-vm app add /path/to/GrainBrick_beta_1.0_TrimUI_Brick_KNULLI.zip"

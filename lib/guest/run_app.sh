@@ -13,8 +13,8 @@ if [ -n "${KNULLI_ROOT:-}" ]; then
     case "$DIR" in "$KNULLI_ROOT"/*) DIR="${DIR#"$KNULLI_ROOT"}";; esac
 fi
 
-lsmod | grep -q snd_dummy || sudo modprobe snd-dummy
 # route the chroot's ALSA default into the loopback card the Mac captures
+# (setup_audio.sh also pins the card indices the apps hardcode)
 if [ -n "${KNULLI_ROOT:-}" ] && [ -x "$G/setup_audio.sh" ]; then
     "$G/setup_audio.sh" "$KNULLI_ROOT" || echo "WARN: audio routing setup failed (silent)" >&2
 fi

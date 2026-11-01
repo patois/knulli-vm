@@ -28,6 +28,8 @@ EmulationStation execs for pygame ports on the device), installed under
 ## Requirements
 
 - Apple Silicon Mac, `brew install lima`, `python3`, `curl`.
+- Xcode Command Line Tools (`xcrun swiftc`) for the small host audio player;
+  everything still installs without it, you just get no sound.
 
 ## Install
 
@@ -44,7 +46,9 @@ The installer: creates the Lima VM (`vm/knulli.yaml`) → deploys guest scripts
 → fetches/verifies (sha256) the image → extracts the OS squashfs
 (`lib/guest/extract_knulli.sh`; the GPT first-LBA sits at partition-entry
 offset **32**, a classic parsing trap) → builds the SDL2 x11 compat library
-→ installs any `--app` you pass.
+→ sets up guest→Mac audio routing → builds the host audio player → installs
+any `--app` you pass. Re-running it is safe: slow steps (VM, extraction,
+SDL build) detect existing state and skip.
 
 ## Using it
 
@@ -85,19 +89,43 @@ streams held button/dpad states into the VM over one ssh pipe — the app's own
 repeat profiles then behave natively. (USB *passthrough* isn't possible:
 Lima/vz exposes no USB, and Virtualization.framework's gamepad support is nil.)
 
-**Audio.** Output is currently silent (`snd-dummy`) — see below.
+**Keyboard.** While the VNC window has Mac keyboard focus, the keys are
+mapped to the pad too (`lib/guest/keymapd.py` taps X11 globally without
+grabbing, so the app still sees raw keys if it wants them):
+
+| keys | pad | keys | pad |
+|---|---|---|---|
+| W A S D / arrows | dpad (diagonals combine) | Q / E | L / R |
+| J / K | A (south) / B (east) | Enter, space | START |
+| U / I | X (west) / Y (north) | BackSpace | SELECT |
+| Z / C | L3 / R3 | m | MODE |
+
+Fast taps are stretched to ≥350 ms — the app samples the pad slowly and
+sub-frame blips vanish — and auto-repeat is absorbed as a held key.
+
+**Audio.** The guest has no sound device, so the chroot's ALSA `default` is
+routed into a `snd-aloop` loopback card (`lib/guest/setup_audio.sh`) and
+`knulli-vm audio start` (run automatically by `start`) captures the far end
+over ssh into `bin/audioplay`, a tiny CoreAudio sink on the Mac. Two details
+that look wrong but are right: the aloop cables are *cross-wired* (default
+writes device 0 playback → host reads device 1 capture), and `snd-dummy`
+occupies card 0 on purpose because apps like GrainBrick open the mic as a
+hardcoded `hw:1,0` — card 1 must be the loopback card.
 
 ## Layout
 
 ```
-install.sh              one-shot installer (image/VM/rootfs/SDL/apps)
-knulli-vm               day-to-day CLI (start/stop/app/input/bridge/...)
+install.sh              one-shot installer (image/VM/rootfs/SDL/audio/apps)
+knulli-vm               day-to-day CLI (start/stop/app/input/bridge/audio/...)
 vm/knulli.yaml          Lima template (Ubuntu 24.04 arm64, vz)
-lib/guest/              deployed into guest ~/knulli-vm (chroot, joypad, launcher,
-                        knulli-image extractor, SDL2 x11 builder)
+lib/guest/              deployed into guest ~/knulli-vm: chroot entry, virtual
+                        joypad, keymapd (keyboard->pad), focusd, launcher,
+                        audio routing, knulli-image extractor, SDL2 x11 builder
 lib/host/pad_bridge.py  macOS gamepad bridge
-state/                  per-VM config + app registry (gitignored)
+lib/host/audioplay.swift CoreAudio sink for guest audio (built to bin/)
+state/                  per-VM config + app registry (gitignored, holds VNC pass)
 downloads/              images, SDL tarballs, app zips (gitignored)
+bin/                    built host binaries (gitignored)
 ```
 
 ## Troubleshooting
@@ -111,6 +139,15 @@ downloads/              images, SDL tarballs, app zips (gitignored)
 - **App stops reacting after restarting the joypad** — recreating the uinput
   device requires restarting the app (SDL delivers events only for opened
   joysticks): `knulli-vm stop && knulli-vm start`.
+- **App silent, or dies/ignores input a few seconds in** — its ALSA stream
+  underruns because nothing is draining the loopback card. `knulli-vm start`
+  starts the audio pipe *before* the app for exactly this reason; if you
+  killed the pipe mid-session, `knulli-vm audio start` (or restart the app).
+- **`arecord` says "Device or resource busy"** — an orphaned capture from a
+  previous session holds the loopback: `knulli-vm audio stop` then `start`.
+- **Keyboard does nothing on the VNC display** — no window manager exists, so
+  `focusd.sh` (started by the launcher) keeps focus on the app window; check
+  `pgrep -f focusd` and `/tmp/focusd.log` in the guest.
 - **VNC shows an auth error before the password prompt** — modern macOS
   Screen Sharing refuses auth-less servers; always start x11vnc with
   `-passwd`.
@@ -121,7 +158,9 @@ downloads/              images, SDL tarballs, app zips (gitignored)
 
 ## Status / known limits
 
-- Video: Xvfb 1280×720 → VNC. Audio: **silent** (`snd-dummy`); piping guest
-  ALSA to the Mac is a work in progress. No mic/USB audio (no such hardware).
+- Video: Xvfb 1280×720 → VNC. Audio out: works (loopback → Mac speakers,
+  48 kHz stereo). Mic in: apps open `hw:1,0` and get a *silent* loopback
+  capture — there is no host-mic→guest pipe yet (would be the mirror of the
+  playback path; `snd-aloop`'s free cross-cable is already there for it).
 - Apps run as root in the chroot (knulli's own model); the VM is the sandbox —
   treat downloaded images/apps as untrusted accordingly.
