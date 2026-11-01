@@ -141,6 +141,9 @@ cmd_start() {
     local dir cmd
     dir=$(grep '^DIR=' "$(appconf "$app")" | cut -d= -f2-)
     cmd=$(grep '^CMD=' "$(appconf "$app")" | cut -d= -f2-)
+    # capture side first: if the app opens its ALSA stream before arecord
+    # exists it underruns repeatedly and can end up ignoring input
+    (cmd_audio start) || echo "  (audio could not start — retry: knulli-vm audio start)"
     echo "starting '$app' in the KNULLI userspace ($VM) ..."
     gexec "KNULLI_ROOT='$ROOTFS' nohup ~/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > ~/knulli-app.log 2>&1 &"
     sleep 8
@@ -152,9 +155,12 @@ cmd_start() {
     fi
     echo "  VNC:  open vnc://localhost:5901   (password: ${VNC_PASS:-knulli})"
     echo "  input: knulli-vm input 'hat down 150'   |   knulli-vm bridge (physical pad)"
+    echo "         keyboard on the VNC screen: WASD/arrows = dpad, JKUI = ABXY"
+    (cmd_audio start) || echo "  (audio could not start — retry: knulli-vm audio start)"
 }
 
 cmd_stop() {
+    cmd_audio stop
     gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f /tmp/knulli-app.pid; echo stopped'
 }
 
@@ -165,6 +171,7 @@ cmd_status() {
         printf "  display: "; pgrep -x Xvfb >/dev/null && echo ":1 up" || echo down
         printf "  vnc:     "; pgrep -x x11vnc >/dev/null && echo ":5901 up" || echo down
         printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
+    printf "  audio:   "; audio_running >/dev/null && echo "streaming to Mac (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming"
     echo "  apps:"; (cmd_app list) | sed 's/^/    /'
 }
 
@@ -181,6 +188,51 @@ cmd_screenshot() {
     limactl shell "$VM" -- cat /tmp/knv-shot.png > "$out" && echo "wrote $out"
 }
 
+# ---- audio -----------------------------------------------------------------
+# The guest has no sound hardware; the chroot's ALSA default is routed into a
+# snd-aloop loopback card (lib/guest/setup_audio.sh) and we capture the other
+# end over ssh into a tiny CoreAudio player on the Mac.
+AUDIO_PIDF="$STATE/audio.$VM.pid"
+AUDIO_BIN="$HERE/bin/audioplay"
+
+audio_running() {
+    local p; p=$(cat "$AUDIO_PIDF" 2>/dev/null) || return 1
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+killtree() {  # kill $1 and all descendants (bash -> limactl/ssh -> audioplay)
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do killtree "$c"; done
+    kill "$p" 2>/dev/null
+}
+
+cmd_audio() {
+    case "${1:-start}" in
+        start)
+            if audio_running; then echo "audio: already streaming (pid $(cat "$AUDIO_PIDF"))"; return; fi
+            if [ ! -x "$AUDIO_BIN" ]; then
+                echo "building host audio player (swiftc) ..."
+                mkdir -p "$HERE/bin"
+                xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
+                    || die "audioplay build failed (need xcrun swiftc: xcode-select --install)"
+            fi
+            nohup bash -c "limactl shell '$VM' -- sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c 2 -t raw -q 2>/dev/null | '$AUDIO_BIN' 48000 2" \
+                >/dev/null 2>&1 &
+            echo $! > "$AUDIO_PIDF"
+            echo "audio: guest loopback -> Mac speakers (pid $!)"
+            ;;
+        stop)
+            if audio_running; then killtree "$(cat "$AUDIO_PIDF")"; fi
+            rm -f "$AUDIO_PIDF"
+            # bracket trick: the pattern must not match this very ssh cmdline
+            gexec 'sudo pkill -f "arecord -D hw:Loopback[,].1,0" 2>/dev/null; true'
+            ;;
+        status)
+            audio_running && echo "streaming (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming";;
+        *) die "audio: start|stop|status";;
+    esac
+}
+
 cmd_bridge() {
     local vdir="$HERE/padenv"
     if [ ! -x "$vdir/bin/python" ]; then
@@ -193,7 +245,7 @@ cmd_bridge() {
 
 cmd_sync() {
     gexec "mkdir -p ~/knulli-vm"
-    for f in knulli-chroot.sh virtual_joypad.py run_app.sh; do
+    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh; do
         limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
     done
     echo "guest scripts synced"
@@ -208,6 +260,7 @@ case "${1:-help}" in
     input) shift; cmd_input "$*";;
     screenshot|shot) shift; cmd_screenshot "$@";;
     bridge) cmd_bridge;;
+    audio) shift; cmd_audio "$@";;
     app) shift; cmd_app "$@";;
     sync) cmd_sync;;
     help|--help|-h)
@@ -220,7 +273,12 @@ knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
   knulli-vm vnc                 VNC URL + password
   knulli-vm screenshot [file]   grab the VM display
   knulli-vm input "CMD"         gamepad FIFO: press|hold|release BUTTON,
-                                hat DIR [ms], holdhat DIR|none, axis lx|ly V
+                                hat DIR [ms] (incl. diagonals), holdhat
+                                DIR|none, axis lx|ly V
+                                (on the VNC screen the keyboard itself maps:
+                                WASD/arrows=dpad, JKUI=ABXY, QE=LR,
+                                Enter=Start BackSpace=Select m=Mode ZX=L3/R3)
+  knulli-vm audio start|stop    pipe guest audio to the Mac (auto by start)
   knulli-vm bridge              feed a physical USB/BT pad (plugged into Mac)
   knulli-vm app add SRC [--name N] [--cmd C] [--default]
   knulli-vm app rm NAME | app list | app default NAME

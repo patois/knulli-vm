@@ -1,7 +1,11 @@
 # Everything downloaded or unpacked at install time stays out of the repo:
-downloads/          # knulli images, SDL2 tarballs, app archives
-state/              # per-VM config, installed-app registry
-padenv/             # host venv for pad_bridge.py (pip-installed)
+#   downloads/  knulli images, SDL2 tarballs, app archives
+#   state/      per-VM config (contains the VNC password), app registry
+#   padenv/     host venv for pad_bridge.py (pip-installed)
+downloads/
+state/
+padenv/
 __pycache__/
 *.pyc
 .DS_Store
+bin/

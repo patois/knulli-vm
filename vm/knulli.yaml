@@ -22,5 +22,7 @@ provision:
       squashfs-tools \
       alsa-utils \
       xvfb x11vnc xauth \
-      imagemagick
+      imagemagick \
+      xdotool \
+      python3-xlib
     apt-get clean

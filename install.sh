@@ -67,7 +67,8 @@ say "VM '$VM' is up"
 # ---- 2. deploy guest scripts ---------------------------------------------------
 mkdir -p "$STATE"
 gexec "mkdir -p ~/knulli-vm"
-for f in knulli-chroot.sh virtual_joypad.py run_app.sh extract_knulli.sh build_sdl2_x11.sh; do
+for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py \
+         focusd.sh extract_knulli.sh build_sdl2_x11.sh; do
     limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
 done
 say "guest scripts deployed to ~/knulli-vm"
@@ -119,6 +120,10 @@ limactl shell "$VM" -- bash -lc "~/knulli-vm/extract_knulli.sh '$IMAGE' '$ROOTFS
 # ---- 5. SDL2 x11 compat build ---------------------------------------------------
 limactl shell "$VM" -- bash -lc "~/knulli-vm/build_sdl2_x11.sh '$ROOTFS'" \
     || die "SDL2 x11-compat build failed"
+
+# ---- 5b. audio routing (loopback card -> Mac) -----------------------------------
+limactl shell "$VM" -- bash -lc "~/knulli-vm/setup_audio.sh '$ROOTFS'" \
+    || say "WARNING: audio setup failed (the app will be silent)"
 
 # ---- 6. config ------------------------------------------------------------------
 CONF="$STATE/$VM.conf"

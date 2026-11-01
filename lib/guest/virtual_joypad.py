@@ -10,7 +10,8 @@ Commands via FIFO (echo "press SOUTH" > /tmp/joypad.fifo):
   press BUTTON [ms]   tap button (default 80 ms)
   hold BUTTON         press and keep held
   release BUTTON      release a held button
-  hat DIR [ms]        dpad tap: up|down|left|right (default 120 ms)
+  hat DIR [ms]        dpad tap (default 120 ms); DIR: up|down|left|right|
+                      upleft|upright|downleft|downright
   holdhat DIR         dpad held (repeat until 'holdhat none')
   holdhat none        release held dpad
   axis NAME VALUE     absolute stick: lx|ly  (-32767..32767)
@@ -45,8 +46,15 @@ BTN = {
 }
 ABS_X, ABS_Y = 0x00, 0x01
 ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11
-HAT_DIR = {"up": (ABS_HAT0Y, -1), "down": (ABS_HAT0Y, 1),
-           "left": (ABS_HAT0X, -1), "right": (ABS_HAT0X, 1)}
+# direction -> list of (axis, value) — diagonals set both axes
+HAT_DIR = {
+    "up": [(ABS_HAT0Y, -1)], "down": [(ABS_HAT0Y, 1)],
+    "left": [(ABS_HAT0X, -1)], "right": [(ABS_HAT0X, 1)],
+    "upleft": [(ABS_HAT0Y, -1), (ABS_HAT0X, -1)],
+    "upright": [(ABS_HAT0Y, -1), (ABS_HAT0X, 1)],
+    "downleft": [(ABS_HAT0Y, 1), (ABS_HAT0X, -1)],
+    "downright": [(ABS_HAT0Y, 1), (ABS_HAT0X, 1)],
+}
 HAT_NEUTRAL = [(ABS_HAT0X, 0), (ABS_HAT0Y, 0)]
 AXIS = {"lx": ABS_X, "ly": ABS_Y}
 
@@ -80,7 +88,10 @@ class Pad:
         assert ctypes.sizeof(UInputUserDev) == 1116, ctypes.sizeof(UInputUserDev)
         dev = UInputUserDev()
         dev.name = name.encode()[:79]
-        dev.id = InputId(0x19, 0x045E, 0x028E, 0x1101)  # USB, generic gamepad ids
+        # Neutral ids: with the Xbox ids (045E:028E) SDL's backend renames the
+        # device "Xbox 360 Controller" and apps that match the driver name
+        # (retrogame_joypad) stop seeing it. rocknix-joypad reports no ids.
+        dev.id = InputId(0x03, 0x0000, 0x0000, 0x0001)  # BUS_USB, unset ids
         for ax in (ABS_X, ABS_Y):
             dev.absmax[ax] = 32767
             dev.absmin[ax] = -32767
@@ -114,8 +125,8 @@ class Pad:
         self.key(code, False)
 
     def tap_hat(self, direction, ms=120):
-        code, val = HAT_DIR[direction]
-        self.abs_(code, val)
+        for code, val in HAT_DIR[direction]:
+            self.abs_(code, val)
         time.sleep(ms / 1000.0)
         for c, v in HAT_NEUTRAL:
             self.abs_(c, v)
@@ -152,10 +163,13 @@ def handle(pad, line):
             for c, v in HAT_NEUTRAL:
                 pad.abs_(c, v)
         elif cmd == "holdhat" and parts[1].lower() in HAT_DIR:
-            code, val = HAT_DIR[parts[1].lower()]
-            other = ABS_HAT0X if code == ABS_HAT0Y else ABS_HAT0Y
-            pad.abs_(other, 0)  # diagonal-free: only one axis at a time
-            pad.abs_(code, val)
+            axes = HAT_DIR[parts[1].lower()]
+            used = {c for c, _ in axes}
+            for ax in (ABS_HAT0X, ABS_HAT0Y):
+                if ax not in used:
+                    pad.abs_(ax, 0)
+            for code, val in axes:
+                pad.abs_(code, val)
         elif cmd == "axis" and parts[1].lower() in AXIS:
             pad.abs_(AXIS[parts[1].lower()], max(-32767, min(32767, int(parts[2]))))
         else:
