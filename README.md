@@ -69,9 +69,13 @@ open vnc://localhost:5901      # macOS Screen Sharing; password 'knulli'
 ```
 
 Launch-script auto-detection: `gb_launch.py` → `main.py` → `run.sh` → a lone
-`*.sh` (override with `--cmd`). Apps land in
-`<rootfs>/userdata/roms/ports/<name>/` and are exec'd the way knulli's
-EmulationStation does it (`cd <appdir> && /usr/bin/pygame <script>`).
+`*.sh` (override with `--cmd`). A single top-level directory inside the zip
+wins as the app root even with loose `*.sh` launcher companions next to it.
+Apps land in `<rootfs>/userdata/roms/ports/<name>/` and are exec'd the way
+knulli's EmulationStation does it (`cd <appdir> && /usr/bin/pygame <script>`).
+Re-adding an app name upgrades it in place while preserving the user's
+`samples/`, `recordings/`, `projects/` and `*.json` settings inside the app
+dir — same contract the app's own README promises for device upgrades.
 
 **Input.** The VM has an emulated `retrogame_joypad` — a uinput replica of
 knulli's `rocknix-joypad` kernel driver (same device name GrainBrick checks
@@ -153,6 +157,10 @@ bin/                    built host binaries (gitignored)
   `-passwd`.
 - **`pkill -f <pattern>` from a shell whose cmdline contains the pattern kills
   your own ssh session** — use `pattern[.]ext`.
+- **Copies from host paths land double-nested (`dst/name/name/`)** — on
+  Lima's virtiofs mount `cp -a path/ dest/` (trailing slash) copies the
+  directory *itself*, not its contents; use the `path/.` form. This bit the
+  app installer repeatedly before it was diagnosed.
 - `limactl start` may stall on lima's optional containerd step; the VM is
   usable regardless — `limactl shell <vm>`.
 

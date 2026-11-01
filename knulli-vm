@@ -63,16 +63,19 @@ cmd_app_add() {
     esac
     [ -e "$src" ] || die "app source not found: $src"
 
-    # unpack zips; find the app root (single top-level dir wins)
+    # unpack zips; find the app root. A single top-level directory wins even
+    # when loose *.sh launcher companions sit next to it (GrainBrick's zip:
+    # "GrainBrick beta 1.0.sh" + grainbrick-beta/) — those .sh files are
+    # device-side launcher stubs, not the app.
     local root
     if [ -d "$src" ]; then root="$src"
     elif unzip -l "$src" >/dev/null 2>&1; then
         local u="$HERE/downloads/unpacked/$(basename "${src%.zip}")"
         [ -d "$u" ] || { mkdir -p "$u"; unzip -q "$src" -d "$u"; }
-        local n nf
+        local n nsh
         n=$(find "$u" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-        nf=$(find "$u" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
-        if [ "$n" = 1 ] && [ "$nf" = 0 ]; then root=$(find "$u" -mindepth 1 -maxdepth 1 -type d); else root="$u"; fi
+        nsh=$(find "$u" -mindepth 1 -maxdepth 1 -type f ! -name '*.sh' | wc -l | tr -d ' ')
+        if [ "$n" = 1 ] && [ "$nsh" = 0 ]; then root=$(find "$u" -mindepth 1 -maxdepth 1 -type d); else root="$u"; fi
     else die "unsupported app source (want .zip or directory): $src"; fi
 
     [ -n "$name" ] || name=$(basename "$root" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')
@@ -85,13 +88,46 @@ cmd_app_add() {
     local gdest="\$HOME/knulli-ports/$name"   # staging dir inside the guest
     local rdest="$ROOTFS/userdata/roms/ports/$name"
     echo "installing '$name' -> $rdest"
+    # Upgrades preserve user data: apps like GrainBrick keep samples,
+    # recordings, projects and settings INSIDE the app dir, and the app's
+    # own README promises upgrades keep them. We stash those paths, install
+    # the new version fresh, then lay the user's files back on top (user
+    # wins; new-version defaults fill the gaps).
+    #
+    # Copy notes: $gdest carries a literal $HOME for the GUEST to expand, so
+    # it must stay outside single quotes (app names are sanitized — never
+    # spaces). Always copy CONTENTS with the /. form: on Lima's virtiofs
+    # mount of the host home, `cp -a path/ dest/` (trailing slash) wrongly
+    # copies the directory ITSELF into dest — that produced maddening
+    # double-nested app dirs until diagnosed with a live probe. Also: no
+    # backticks in comments inside this string — double quotes turn them
+    # into command substitutions.
     gexec "
         set -e
         sudo rm -rf $gdest && mkdir -p $gdest
-        cp -a '$root'/ $gdest/
+        cp -a '$root'/. $gdest/
+        keep=()
+        for p in samples recordings projects; do
+            [ -d '$rdest/'\"\$p\" ] && keep+=(\"\$p\")
+        done
+        for f in '$rdest'/*.json; do
+            [ -f \"\$f\" ] && keep+=(\"\$(basename \"\$f\")\")
+        done
+        stash=
+        if [ \${#keep[@]} -gt 0 ]; then
+            stash=\$(mktemp -d)
+            for p in \${keep[@]}; do
+                sudo mv '$rdest/'\"\$p\" \"\$stash/\"
+            done
+            echo \"  preserving: \${keep[*]}\"
+        fi
         sudo rm -rf '$rdest'
-        sudo mkdir -p \"\$(dirname '$rdest')\"
-        sudo cp -a $gdest '$rdest'
+        sudo mkdir -p '$rdest'
+        sudo cp -a $gdest/. '$rdest/'
+        if [ -n \"\$stash\" ]; then
+            sudo cp -a \"\$stash/.\" '$rdest/'
+            sudo rm -rf \"\$stash\"
+        fi
         sudo rm -rf $gdest
     " || die "copy into rootfs failed"
 

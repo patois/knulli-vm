@@ -12,6 +12,17 @@ SUDO=sudo
 [ -r "$IMG" ] || { echo "cannot read image: $IMG" >&2; exit 1; }
 command -v unsquashfs >/dev/null || { echo "squashfs-tools missing in guest" >&2; exit 1; }
 
+# Check the destination BEFORE touching the image: a re-run against an
+# already-extracted rootfs must return immediately, not re-parse/re-mount.
+if [ -d "$DEST" ] && ! $SUDO find "$DEST" -maxdepth 0 -empty 2>/dev/null | grep -q .; then
+    if $SUDO test -d "$DEST/usr/lib/python3.12/site-packages/pygame" 2>/dev/null; then
+        echo "rootfs already extracted at $DEST — skipping"
+        exit 0
+    fi
+    echo "ERROR: $DEST exists and is not an extracted knulli rootfs; refusing to touch it" >&2
+    exit 1
+fi
+
 # --- locate the FAT32 boot-resource partition -------------------------------
 read -r OFF SIZE <<<"$(python3 - "$IMG" <<'PY'
 import struct, sys
@@ -50,8 +61,8 @@ PY
 echo "boot-resource partition: offset=$OFF size=$SIZE"
 
 # --- pull boot/knulli (the OS squashfs) out of the FAT32 partition ----------
-MNT=$(mktemp -d /mnt/knulli-br.XXXXXX)
-umount_br() { $SUDO umount "$MNT" 2>/dev/null || true; rmdir "$MNT" 2>/dev/null || true; }
+MNT=$($SUDO mktemp -d /mnt/knulli-br.XXXXXX)   # /mnt is root-writable only
+umount_br() { $SUDO umount "$MNT" 2>/dev/null || true; $SUDO rmdir "$MNT" 2>/dev/null || true; }
 trap umount_br EXIT
 $SUDO mount -o ro,loop,offset="$OFF" "$IMG" "$MNT"
 SQ="$MNT/boot/knulli"
@@ -62,14 +73,6 @@ $SUDO install -m 644 -o "$(id -u)" -g "$(id -g)" "$SQ" "$TMP_SQ"
 umount_br; trap - EXIT
 
 # --- unsquashfs into the chroot dir -----------------------------------------
-if [ -d "$DEST" ] && ! $SUDO find "$DEST" -maxdepth 0 -empty 2>/dev/null | grep -q .; then
-    if $SUDO test -d "$DEST/usr/lib/python3.12/site-packages/pygame" 2>/dev/null; then
-        echo "rootfs already extracted at $DEST — skipping"
-        exit 0
-    fi
-    echo "ERROR: $DEST exists and is not an extracted knulli rootfs; refusing to touch it" >&2
-    exit 1
-fi
 $SUDO mkdir -p "$DEST"
 echo "unsquashfs -> $DEST (a few minutes) ..."
 $SUDO unsquashfs -no-xattrs -d "$DEST" "$TMP_SQ" >/dev/null

@@ -74,8 +74,15 @@ done
 say "guest scripts deployed to ~/knulli-vm"
 
 # ---- 3. obtain the knulli image ------------------------------------------------
+ROOTFS=$(gexec 'echo $HOME/knulli-root')
 mkdir -p "$DL"
-if [ -n "$IMAGE" ]; then
+if gexec "test -d '$ROOTFS/usr/lib/python3.12/site-packages/pygame'" 2>/dev/null; then
+    # The image is only a carrier for the squashfs; once the rootfs exists
+    # it is no longer needed — a re-run must not re-download 2 GB.
+    say "rootfs already extracted — skipping image fetch (pass --image to re-extract)"
+    IMAGE=$(grep '^IMAGE=' "$STATE/$VM.conf" 2>/dev/null | cut -d= -f2- || true)
+    IMAGE="${IMAGE:-already-extracted}"
+elif [ -n "$IMAGE" ]; then
     [ -f "$IMAGE" ] || die "image not found: $IMAGE"
     IMAGE=$(cd "$(dirname "$IMAGE")" && pwd)/$(basename "$IMAGE")
 else
@@ -98,7 +105,7 @@ PY
     IMAGE="${gz%.gz}"
     if [ ! -f "$IMAGE" ]; then
         say "downloading $IMAGE_URL (~2 GB)"
-        curl -fL -C -- -o "$gz" "$IMAGE_URL" || die "download failed"
+        curl -fL -C - -o "$gz" "$IMAGE_URL" || die "download failed"
         sha_url="$IMAGE_URL.sha256"
         if curl -fsL -o "$gz.sha256" "$sha_url" 2>/dev/null; then
             say "verifying sha256"
@@ -113,9 +120,10 @@ fi
 say "image: $IMAGE"
 
 # ---- 4. extract the knulli rootfs ----------------------------------------------
-ROOTFS=$(gexec 'echo $HOME/knulli-root')
-limactl shell "$VM" -- bash -lc "~/knulli-vm/extract_knulli.sh '$IMAGE' '$ROOTFS'" \
-    || die "rootfs extraction failed"
+if [ -f "$IMAGE" ]; then
+    limactl shell "$VM" -- bash -lc "~/knulli-vm/extract_knulli.sh '$IMAGE' '$ROOTFS'" \
+        || die "rootfs extraction failed"
+fi
 
 # ---- 5. SDL2 x11 compat build ---------------------------------------------------
 limactl shell "$VM" -- bash -lc "~/knulli-vm/build_sdl2_x11.sh '$ROOTFS'" \

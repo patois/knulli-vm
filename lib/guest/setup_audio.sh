@@ -18,7 +18,7 @@ $SUDO modprobe snd-dummy 2>/dev/null || true
 $SUDO modprobe snd-aloop 2>/dev/null || true
 # /proc/asound/cards says "Loopback"; the module name is what to check
 grep -q snd_aloop /proc/modules || { echo "snd-aloop failed to load" >&2; exit 1; }
-if ! grep -q "^Loopback$" /proc/asound/cards 2>/dev/null || ! grep -q "1 \[Loopback" /proc/asound/cards; then
+if ! grep -q "^[[:space:]]*1 \[Loopback" /proc/asound/cards; then
     echo "WARNING: Loopback is not card 1 — apps with hardcoded hw:1,0 will mis-open" >&2
     grep -E "Loopback|Dummy" /proc/asound/cards >&2 || true
 fi
