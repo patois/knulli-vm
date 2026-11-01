@@ -1,0 +1,26 @@
+# knulli-vm Lima template: Ubuntu 24.04 arm64 host for the extracted KNULLI
+# userspace (the KNULLI image itself is Allwinner/Rockchip device firmware and
+# cannot boot under Virtualization.framework — we chroot its squashfs instead).
+# Host home is mounted read-only so the guest can read downloaded images/apps.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+- template:_default/mounts
+
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -euxo pipefail
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      squashfs-tools \
+      alsa-utils \
+      xvfb x11vnc xauth \
+      imagemagick
+    apt-get clean

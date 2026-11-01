@@ -1,0 +1,232 @@
+#!/bin/bash
+# knulli-vm — manage a VM that runs apps inside the extracted KNULLI
+# (TrimUI Brick et al.) userspace. See README.md.
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STATE="$HERE/state"
+
+die() { echo "knulli-vm: $*" >&2; exit 1; }
+
+# ---- selection & config -----------------------------------------------------
+VM=""
+while [ $# -ge 1 ] && [ "$1" = "--vm" ]; do VM="$2"; shift 2; done
+if [ -z "$VM" ]; then
+    [ -f "$STATE/default" ] || die "no VM configured — run ./install.sh first (or pass --vm NAME)"
+    VM=$(cat "$STATE/default")
+fi
+CONF="$STATE/$VM.conf"
+[ -f "$CONF" ] || die "no config for VM '$VM' ($CONF)"
+# shellcheck disable=SC2046
+eval "$(grep -E '^[A-Z_]+=' "$CONF" | sed 's/^/export /')"
+
+gexec() { limactl shell "$VM" -- bash -lc "$1"; }
+appconf() { echo "$STATE/$VM.apps/$1"; }
+
+default_app() {
+    if [ -n "${DEFAULT_APP:-}" ] && [ -f "$(appconf "$DEFAULT_APP")" ]; then
+        echo "$DEFAULT_APP"; return
+    fi
+    ls "$STATE/$VM.apps" 2>/dev/null | head -1
+}
+
+# ---- app registry -------------------------------------------------------------
+detect_cmd() {  # $1 = app root dir (host path)
+    local d="$1"
+    if [ -f "$d/gb_launch.py" ]; then echo "/usr/bin/pygame gb_launch.py"
+    elif [ -f "$d/main.py" ]; then echo "/usr/bin/pygame main.py"
+    elif [ -f "$d/run.sh" ]; then echo "bash run.sh"
+    elif [ "$(find "$d" -maxdepth 1 -name '*.sh' | wc -l | tr -d ' ')" = 1 ]; then
+        echo "bash '$(basename "$(find "$d" -maxdepth 1 -name '*.sh')")'"
+    else return 1; fi
+}
+
+cmd_app_add() {
+    local src="" name="" cmd="" make_default=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) name="$2"; shift 2;;
+            --cmd) cmd="$2"; shift 2;;
+            --default) make_default=1; shift;;
+            -*) die "unknown flag $1";;
+            *) src="$1"; shift;;
+        esac
+    done
+    [ -n "$src" ] || die "app add: need a source (zip/dir path or URL)"
+
+    # fetch URLs
+    case "$src" in
+        http://*|https://*)
+            mkdir -p "$HERE/downloads"
+            local f="$HERE/downloads/$(basename "${src%%\?*}")"
+            [ -f "$f" ] || { echo "downloading $src ..."; curl -fL --progress-bar -o "$f" "$src"; }
+            src="$f";;
+    esac
+    [ -e "$src" ] || die "app source not found: $src"
+
+    # unpack zips; find the app root (single top-level dir wins)
+    local root
+    if [ -d "$src" ]; then root="$src"
+    elif unzip -l "$src" >/dev/null 2>&1; then
+        local u="$HERE/downloads/unpacked/$(basename "${src%.zip}")"
+        [ -d "$u" ] || { mkdir -p "$u"; unzip -q "$src" -d "$u"; }
+        local n nf
+        n=$(find "$u" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+        nf=$(find "$u" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+        if [ "$n" = 1 ] && [ "$nf" = 0 ]; then root=$(find "$u" -mindepth 1 -maxdepth 1 -type d); else root="$u"; fi
+    else die "unsupported app source (want .zip or directory): $src"; fi
+
+    [ -n "$name" ] || name=$(basename "$root" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')
+    [ -n "$name" ] || die "could not derive an app name; pass --name"
+
+    if [ -z "$cmd" ]; then
+        cmd=$(detect_cmd "$root") || die "cannot auto-detect a launch script in $root (tried gb_launch.py, main.py, run.sh, one *.sh) — pass --cmd"
+    fi
+
+    local gdest="\$HOME/knulli-ports/$name"   # staging dir inside the guest
+    local rdest="$ROOTFS/userdata/roms/ports/$name"
+    echo "installing '$name' -> $rdest"
+    gexec "
+        set -e
+        sudo rm -rf $gdest && mkdir -p $gdest
+        cp -a '$root'/ $gdest/
+        sudo rm -rf '$rdest'
+        sudo mkdir -p \"\$(dirname '$rdest')\"
+        sudo cp -a $gdest '$rdest'
+        sudo rm -rf $gdest
+    " || die "copy into rootfs failed"
+
+    mkdir -p "$STATE/$VM.apps"
+    printf 'DIR=%s\nCMD=%s\n' "$rdest" "$cmd" > "$(appconf "$name")"
+    if [ "$make_default" = 1 ] || [ -z "$(default_app)" ]; then
+        grep -v '^DEFAULT_APP=' "$CONF" > "$CONF.tmp" || true
+        echo "DEFAULT_APP=$name" >> "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    fi
+    echo "installed. launch with: knulli-vm start $name"
+}
+
+cmd_app_rm() {
+    local name="${1:-}"; [ -n "$name" ] || die "app rm: need a name"
+    [ -f "$(appconf "$name")" ] || die "no app '$name'"
+    local rdest; rdest=$(grep '^DIR=' "$(appconf "$name")" | cut -d= -f2-)
+    gexec "sudo rm -rf '$rdest'"
+    rm -f "$(appconf "$name")"
+    echo "removed $name"
+}
+
+cmd_app() {
+    case "${1:-list}" in
+        add) shift; cmd_app_add "$@";;
+        rm|remove) shift; cmd_app_rm "$@";;
+        default) [ -n "${2:-}" ] || die "app default: need a name"
+            [ -f "$(appconf "$2")" ] || die "no app '$2'"
+            grep -v '^DEFAULT_APP=' "$CONF" > "$CONF.tmp"; echo "DEFAULT_APP=$2" >> "$CONF.tmp"; mv "$CONF.tmp" "$CONF"
+            echo "default app: $2";;
+        list)
+            local d; d=$(default_app)
+            for f in "$STATE/$VM.apps"/*; do
+                [ -e "$f" ] || { echo "(no apps installed)"; break; }
+                local n; n=$(basename "$f")
+                local tag=""; [ "$n" = "$d" ] && tag=" [default]"
+                echo "  $n$tag  $(grep '^CMD=' "$f" | cut -d= -f2-)  <- $(grep '^DIR=' "$f" | cut -d= -f2-)"
+            done;;
+        *) die "app: add|rm|list|default";;
+    esac
+}
+
+# ---- lifecycle ---------------------------------------------------------------
+cmd_start() {
+    local app="${1:-}"; app=${app:-$(default_app)}
+    { [ -n "$app" ] && [ -f "$(appconf "$app")" ]; } || {
+        cmd_app list; die "no app to start — install one: knulli-vm app add <zip|dir|url>"; }
+    local dir cmd
+    dir=$(grep '^DIR=' "$(appconf "$app")" | cut -d= -f2-)
+    cmd=$(grep '^CMD=' "$(appconf "$app")" | cut -d= -f2-)
+    echo "starting '$app' in the KNULLI userspace ($VM) ..."
+    gexec "KNULLI_ROOT='$ROOTFS' nohup ~/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > ~/knulli-app.log 2>&1 &"
+    sleep 8
+    local pid; pid=$(gexec "cat /tmp/knulli-app.pid 2>/dev/null")
+    if [ -n "$pid" ] && gexec "kill -0 '$pid'" 2>/dev/null; then
+        echo "OK — $app running (guest pid $pid)"
+    else
+        echo "failed; app log:"; gexec "tail -20 ~/knulli-app.log"; exit 1
+    fi
+    echo "  VNC:  open vnc://localhost:5901   (password: ${VNC_PASS:-knulli})"
+    echo "  input: knulli-vm input 'hat down 150'   |   knulli-vm bridge (physical pad)"
+}
+
+cmd_stop() {
+    gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f /tmp/knulli-app.pid; echo stopped'
+}
+
+cmd_status() {
+    limactl list | grep -E "NAME|$VM[[:space:]]" | head -2
+    gexec '
+        printf "  joypad:  "; pgrep -f "virtual_joypad[.]py" >/dev/null && echo up || echo down
+        printf "  display: "; pgrep -x Xvfb >/dev/null && echo ":1 up" || echo down
+        printf "  vnc:     "; pgrep -x x11vnc >/dev/null && echo ":5901 up" || echo down
+        printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
+    echo "  apps:"; (cmd_app list) | sed 's/^/    /'
+}
+
+cmd_vnc() { echo "vnc://localhost:5901  (password: ${VNC_PASS:-knulli})"; }
+
+cmd_input() {
+    [ -n "${1:-}" ] || die "input: give a FIFO command, e.g. knulli-vm input 'hat down 150'"
+    gexec "printf '%s\n' '$1' | sudo tee /tmp/joypad.fifo >/dev/null" && echo "sent: $1"
+}
+
+cmd_screenshot() {
+    local out="${1:-knulli-vm-shot.png}"
+    gexec "DISPLAY=:1 import -window root /tmp/knv-shot.png" && \
+    limactl shell "$VM" -- cat /tmp/knv-shot.png > "$out" && echo "wrote $out"
+}
+
+cmd_bridge() {
+    local vdir="$HERE/padenv"
+    if [ ! -x "$vdir/bin/python" ]; then
+        echo "creating padenv (host venv for gamepad reading) ..."
+        python3 -m venv "$vdir" && "$vdir/bin/pip" install -q --only-binary :all: pygame-ce \
+            || die "padenv setup failed (need python3 with pygame-ce wheels)"
+    fi
+    "$vdir/bin/python" "$HERE/lib/host/pad_bridge.py" "$VM"
+}
+
+cmd_sync() {
+    gexec "mkdir -p ~/knulli-vm"
+    for f in knulli-chroot.sh virtual_joypad.py run_app.sh; do
+        limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
+    done
+    echo "guest scripts synced"
+}
+
+# ---- dispatch ----------------------------------------------------------------
+case "${1:-help}" in
+    start) shift; cmd_start "$@";;
+    stop) cmd_stop;;
+    status) cmd_status;;
+    vnc) cmd_vnc;;
+    input) shift; cmd_input "$*";;
+    screenshot|shot) shift; cmd_screenshot "$@";;
+    bridge) cmd_bridge;;
+    app) shift; cmd_app "$@";;
+    sync) cmd_sync;;
+    help|--help|-h)
+        cat <<'EOF'
+knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
+
+  knulli-vm start [app]         start services + app (default app if omitted)
+  knulli-vm stop                stop the app
+  knulli-vm status              VM / services / app / installed apps
+  knulli-vm vnc                 VNC URL + password
+  knulli-vm screenshot [file]   grab the VM display
+  knulli-vm input "CMD"         gamepad FIFO: press|hold|release BUTTON,
+                                hat DIR [ms], holdhat DIR|none, axis lx|ly V
+  knulli-vm bridge              feed a physical USB/BT pad (plugged into Mac)
+  knulli-vm app add SRC [--name N] [--cmd C] [--default]
+  knulli-vm app rm NAME | app list | app default NAME
+  knulli-vm sync                redeploy guest scripts after editing lib/guest/
+  knulli-vm --vm NAME ...       target a specific VM (multiple installs ok)
+EOF
+        ;;
+    *) die "unknown command '${1}' (knulli-vm help)";;
+esac
