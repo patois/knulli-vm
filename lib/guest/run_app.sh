@@ -35,8 +35,24 @@ pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
     sleep 1
 }
 pgrep -x Xvfb >/dev/null 2>&1 || (Xvfb :1 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & sleep 1)
-pgrep -x x11vnc >/dev/null 2>&1 || (x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
-    -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1)
+# (re)start x11vnc unless one is ALREADY running with our password. x11vnc
+# scrubs -passwd from its own /proc cmdline, so we track our launches with a
+# hash marker; a running server without a matching marker (foreign instance
+# from a manual setup, or a changed --vnc-pass) gets replaced. A stale
+# marker for a dead server is fine — the pgrep gate catches that.
+MARK=/tmp/knulli-x11vnc.passwd-md5
+want=$(printf '%s' "$VNC_PASS" | md5sum | cut -d' ' -f1)
+if pgrep -x x11vnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
+    x_ok=1
+else
+    x_ok=0
+fi
+if [ "$x_ok" = 0 ]; then
+    pkill -x x11vnc 2>/dev/null; sleep 1
+    x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
+        -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1
+    echo "$want" > "$MARK"
+fi
 
 # stop a previously launched app (sudo forwards SIGTERM into the chroot)
 if [ -f "$PIDF" ]; then
