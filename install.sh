@@ -81,18 +81,17 @@ fi
 say "VM '$VM' is up"
 
 # ---- 2. deploy guest scripts ---------------------------------------------------
-# Keep this list in sync with lib/guest/ (knulli-vm sync has its own copy of
-# the list): a missing entry silently breaks its feature on fresh installs —
-# audio_capture.sh absent meant "the app is silent" with every step green.
-# A failed copy must abort: printing "deployed" after failures sends you off
-# to debug the wrong machine.
+# Directory-driven on purpose: hand-maintained lists drifted before
+# (audio_capture.sh went undeployed — fresh installs silently mute with
+# every step green), so EVERY file in lib/guest/ ships, no list to forget.
+# A failed copy aborts: printing "deployed" after failures sends you off to
+# debug the wrong machine.
 mkdir -p "$STATE"
 gexec "mkdir -p ~/knulli-vm"
-for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py \
-         focusd.sh extract_knulli.sh build_sdl2_x11.sh sdl_pad_probe.py audio_capture.sh; do
-    [ -f "$HERE/lib/guest/$f" ] || die "missing lib/guest/$f (corrupted checkout?)"
-    limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f" \
-        || die "failed to deploy lib/guest/$f to the guest"
+for f in "$HERE"/lib/guest/*; do
+    [ -f "$f" ] || die "no guest scripts in lib/guest/ (corrupted checkout?)"
+    limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$(basename "$f")" < "$f" \
+        || die "failed to deploy lib/guest/$(basename "$f") to the guest"
 done
 say "guest scripts deployed to ~/knulli-vm"
 
@@ -179,7 +178,11 @@ say "config: $CONF"
 # ---- 7. host audio player ---------------------------------------------------
 # Guest has no sound hardware; `knulli-vm audio` streams the loopback card
 # over ssh into this CoreAudio sink (built with the Xcode CLT compiler).
-if [ ! -x "$HERE/bin/audioplay" ]; then
+# rebuild when stale too, not just when absent: an install from before the
+# AVAudioEngine rewrite would otherwise keep running the old AudioQueue
+# binary — which rendered nothing — through every later re-run.
+if [ ! -x "$HERE/bin/audioplay" ] || \
+   [ "$HERE/lib/host/audioplay.swift" -nt "$HERE/bin/audioplay" ]; then
     if command -v xcrun >/dev/null && xcrun --find swiftc >/dev/null 2>&1; then
         say "building host audio player (bin/audioplay)"
         mkdir -p "$HERE/bin"

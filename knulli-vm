@@ -290,7 +290,9 @@ cmd_audio() {
     case "${1:-start}" in
         start)
             if audio_running; then echo "audio: already streaming (pid $(cat "$AUDIO_PIDF"))"; return; fi
-            if [ ! -x "$AUDIO_BIN" ]; then
+            # rebuild on staleness, not just absence (see install.sh note)
+            if [ ! -x "$AUDIO_BIN" ] || \
+               [ "$HERE/lib/host/audioplay.swift" -nt "$AUDIO_BIN" ]; then
                 echo "building host audio player (swiftc) ..."
                 mkdir -p "$HERE/bin"
                 xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
@@ -335,8 +337,11 @@ cmd_bridge() {
 
 cmd_sync() {
     gexec "mkdir -p ~/knulli-vm"
-    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh sdl_pad_probe.py audio_capture.sh; do
-        limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
+    # directory-driven, same policy as install.sh: ship everything in
+    # lib/guest/, fail on the first bad copy
+    for f in "$HERE"/lib/guest/*; do
+        limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$(basename "$f")" < "$f" \
+            || die "failed to deploy lib/guest/$(basename "$f")"
     done
     echo "guest scripts synced"
 }
