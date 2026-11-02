@@ -130,11 +130,18 @@ auto-repeat is absorbed as a single held key.
 **Audio.** The guest has no sound device, so the chroot's ALSA `default` is
 routed into a `snd-aloop` loopback card (`lib/guest/setup_audio.sh`) and
 `knulli-vm audio start` (run automatically by `start`) captures the far end
-over ssh into `bin/audioplay`, a tiny CoreAudio sink on the Mac. Two details
+over ssh into `bin/audioplay`, a tiny CoreAudio sink on the Mac. Three details
 that look wrong but are right: the aloop cables are *cross-wired* (default
-writes device 0 playback → host reads device 1 capture), and `snd-dummy`
-occupies card 0 on purpose because apps like GrainBrick open the mic as a
-hardcoded `hw:1,0` — card 1 must be the loopback card. Latency is tuned for
+writes device 0 playback → host reads device 1 capture); `snd-dummy` occupies
+card 0 on purpose because apps like GrainBrick open the mic as a hardcoded
+`hw:1,0` — card 1 must be the loopback card; and the capture *subdevice* is
+discovered at run time by `lib/guest/audio_capture.sh`, never hardcoded —
+snd-aloop hands out one substream per opened stream (cable N = playback subN
+→ capture subN), and GrainBrick opens several (its UI preview stream, plus
+the aplay its audio pump spawns), so the only sub carrying the app's main
+output is the one owned by the running `aplay` process. Hardcoding sub0 once
+meant hours of "the app outputs pure silence" while an orphaned app instance
+held sub0 in XRUN and real audio flowed on sub3, unseen. Latency is tuned for
 playability: `arecord -B 100000 -F 25000` (100 ms buffer / 25 ms periods) and
 25 ms CoreAudio chunks in `audioplay`, end-to-end ≈ 80–100 ms behind the VM.
 
@@ -169,8 +176,25 @@ bin/                    built host binaries (gitignored)
   underruns because nothing is draining the loopback card. `knulli-vm start`
   starts the audio pipe *before* the app for exactly this reason; if you
   killed the pipe mid-session, `knulli-vm audio start` (or restart the app).
+- **"App outputs pure silence" but its own meters animate** — suspect the
+  *capture*, not the app. Ground truth is in the guest:
+  `pgrep -a -x aplay` (should be exactly one, under the app tree) and
+  `sudo cat /proc/asound/card1/pcm0p/sub*/status` — find the sub whose
+  `owner_pid` is that aplay; its `hw_ptr` must advance in real time, and
+  the same sub under `pcm1c/` is the cable to capture. A second `gb_launch`
+  process means an orphaned app instance (old builds of `stop` left them;
+  they respawn their aplay when killed) — `knulli-vm stop` now kills the
+  whole tree, clean leftovers with `sudo pkill -f 'gb_launch[.]py'` plus
+  `sudo pkill -x aplay`. A sub in `state: XRUN` produces exactly the pure
+  zeros that get mistaken for a silent app.
 - **`arecord` says "Device or resource busy"** — an orphaned capture from a
   previous session holds the loopback: `knulli-vm audio stop` then `start`.
+- **VNC keyboard/mouse laggy by seconds** — this was x11vnc starving its own
+  client input queue while diffing the framebuffer (Recv-Q grew unboundedly
+  under animation). Fixed by serving the display with TigerVNC `Xvnc`
+  (X server + VNC in one) instead of Xvfb+x11vnc; `run_app.sh` prefers it
+  automatically. If you're on the Xvfb fallback (no `Xvnc` binary), input
+  lag is expected.
 - **Keyboard does nothing on the VNC display** — `./knulli-vm keymap restart`
   first: that's the mapper (`keymapd.py`) being down or deaf, and it's a
   one-second fix; `./knulli-vm keymap log` then shows every mapped key it
@@ -182,8 +206,8 @@ bin/                    built host binaries (gitignored)
   thread on the joypad FIFO and reconnects if the X connection dies — but
   an old-style deaf instance from before that fix needs one restart.)
 - **VNC shows an auth error before the password prompt** — modern macOS
-  Screen Sharing refuses auth-less servers; always start x11vnc with
-  `-passwd`.
+  Screen Sharing refuses auth-less servers; the launcher starts `Xvnc` with
+  `-SecurityTypes VncAuth -PasswordFile` (x11vnc fallback: `-passwd`).
 - **`pkill -f <pattern>` from a shell whose cmdline contains the pattern kills
   your own ssh session** — use `pattern[.]ext`.
 - **Copies from host paths land double-nested (`dst/name/name/`)** — on
@@ -195,8 +219,11 @@ bin/                    built host binaries (gitignored)
 
 ## Status / known limits
 
-- Video: Xvfb 1280×720 → VNC. Audio out: works (loopback → Mac speakers,
-  48 kHz stereo). Mic in: apps open `hw:1,0` and get a *silent* loopback
+- Video: TigerVNC `Xvnc` serves 1280×720 directly on :5901 (Xvfb+x11vnc only
+  as fallback). Audio out: works (loopback → Mac speakers, 48 kHz stereo;
+  the UI's separate preview stream lands on its own aloop sub and is not
+  piped — main output is the pump's aplay stream, which is). Mic in: apps
+  open `hw:1,0` and get a *silent* loopback
   capture — there is no host-mic→guest pipe yet (would be the mirror of the
   playback path; `snd-aloop`'s free cross-cable is already there for it).
 - Apps run as root in the chroot (knulli's own model); the VM is the sandbox —
