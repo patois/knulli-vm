@@ -7,6 +7,18 @@ retrogame_joypad commands on the virtual_joypad FIFO. Needs python3-xlib
 in the *guest* (apt install python3-xlib) and write access to the FIFO
 (run it with sudo, like virtual_joypad.py).
 
+Resilience (learned the hard way — a silent deaf keyboard is miserable to
+debug over VNC):
+  * FIFO writes happen on a dedicated writer thread with O_NONBLOCK. The
+    RECORD callback must never block: while it stalls, X events pile up in
+    the connection buffer until the server kills the client, and the
+    keyboard then does nothing forever with no error anywhere.
+  * record_enable_context is wrapped in a reconnect loop, so an X server
+    restart (or an overflow disconnect) self-heals instead of going deaf.
+    Held buttons/hat are released across the gap so the pad never sticks.
+  * Every mapped key press/release is logged (to /tmp/keymap.log) so the
+    next "keys don't work" report has ground truth in one tail.
+
 Default map mirrors the TRIMUI BRICK's physical buttons (see README):
 
     dpad            W/S/A/D + arrow keys (diagonals combine: W+A -> upleft)
@@ -23,6 +35,7 @@ Default map mirrors the TRIMUI BRICK's physical buttons (see README):
   hotkey-mode toggle for OS shortcuts) has no meaning for apps.
 """
 import os
+import queue
 import sys
 import threading
 import time
@@ -32,6 +45,11 @@ from Xlib.ext import record
 from Xlib.protocol import rq
 
 FIFO = os.environ.get("JOYPAD_FIFO", "/tmp/joypad.fifo")
+
+
+def log(msg):
+    print(f"keymapd: {msg}", flush=True)
+
 
 # keysym -> ("btn", NAME) or ("hat", DIR); names = virtual_joypad device
 # vocabulary (A B X Y L1 R1 L2 R2 SELECT START MODE TAB-/TAB+)
@@ -57,26 +75,47 @@ KEYMAP = {
     XK.XK_F1: ("btn", "TAB-"), XK.XK_F2: ("btn", "TAB+"),
 }
 
-_fd = None
+# Commands queue to the writer thread; send() itself must never block.
+_cmdq = queue.Queue()
 
 
 def send(line):
-    global _fd
-    data = (line + "\n").encode()
-    for _ in range(2):
-        try:
-            if _fd is None:
-                _fd = os.open(FIFO, os.O_WRONLY)  # blocks until joypad reads
-            os.write(_fd, data)
-            return
-        except OSError:
+    _cmdq.put(line)
+
+
+def writer_loop():
+    """Sole writer to the joypad FIFO, off the X event path.
+
+    Blocking os.open(O_WRONLY) waits for a reader (virtual_joypad) and
+    os.write waits on a full pipe buffer — either one, run inline in the
+    RECORD callback, freezes X event delivery and eventually gets this
+    client disconnected by the X server. O_NONBLOCK + retry makes the
+    worst case here 'a command is delayed', never 'the keyboard dies'.
+    ENXIO = no reader yet (joypad restarting), ENOENT = FIFO was deleted,
+    EPIPE/ENODEV = reader died; all heal by reopening, so retry forever.
+    """
+    fd = None
+    warned = False
+    while True:
+        data = (_cmdq.get() + "\n").encode()
+        while True:
             try:
-                if _fd is not None:
-                    os.close(_fd)
-            except OSError:
-                pass
-            _fd = None
-    print(f"keymapd: cannot write {FIFO}", file=sys.stderr)
+                if fd is None:
+                    fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+                    warned = False
+                os.write(fd, data)
+                break
+            except OSError as e:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+                if not warned:
+                    log(f"cannot write {FIFO} ({e}); retrying until the joypad is back")
+                    warned = True
+                time.sleep(0.2)
 
 
 # Hold floors, measured against GrainBrick (empirically bracketed 2026-11-02):
@@ -117,6 +156,7 @@ class HatState:
     def __init__(self):
         self.pressed = []  # directions, most recent last
         self.delayed = Delayed()
+        self.last = None
 
     def press(self, d):
         self.delayed.cancel(d)
@@ -136,32 +176,42 @@ class HatState:
 
         self.delayed.schedule(d, fire, HAT_HOLD)
 
+    def reset(self):
+        for d in list(self.pressed):
+            self.delayed.cancel(d)
+        self.pressed = []
+        self.update()
+
     def update(self):
         p = set(self.pressed)
         if not p:
+            pos = "none"
             send("holdhat none")
-            return
-        v = []
-        if "up" in p or "down" in p:
-            v.append("up" if "up" in p else "down")
-        if "left" in p or "right" in p:
-            v.append("left" if "left" in p else "right")
-        # for an up/down clash, the most recently pressed wins
-        if p >= {"up", "down"}:
-            v[0] = "up" if self.pressed.index("up") > self.pressed.index("down") else "down"
-        if p >= {"left", "right"} and len(v) > 1:
-            v[1] = "left" if self.pressed.index("left") > self.pressed.index("right") else "right"
-        send("holdhat " + "".join(v))
+        else:
+            v = []
+            if "up" in p or "down" in p:
+                v.append("up" if "up" in p else "down")
+            if "left" in p or "right" in p:
+                v.append("left" if "left" in p else "right")
+            # for an up/down clash, the most recently pressed wins
+            if p >= {"up", "down"}:
+                v[0] = "up" if self.pressed.index("up") > self.pressed.index("down") else "down"
+            if p >= {"left", "right"} and len(v) > 1:
+                v[1] = "left" if self.pressed.index("left") > self.pressed.index("right") else "right"
+            pos = "".join(v)
+            send("holdhat " + pos)
+        if pos != self.last:
+            log(f"hat {pos}")
+            self.last = pos
 
 
-def main():
+def tap_once(hat, held, btn_delayed):
+    """One RECORD tap on the current X connection. Blocks in
+    record_enable_context until the connection dies (server restart,
+    buffer overflow), then returns so the caller can reconnect."""
     disp = display.Display()
     if not disp.has_extension("RECORD"):
         sys.exit("keymapd: X RECORD extension missing")
-
-    hat = HatState()
-    held = set()
-    btn_delayed = Delayed()
 
     def on_key(event, pressed):
         ks = disp.keycode_to_keysym(event.detail, 0)
@@ -174,10 +224,12 @@ def main():
                 btn_delayed.cancel(target)
                 if target not in held:
                     held.add(target)
+                    log(f"btn {target} down")
                     send(f"hold {target}")
             elif target in held:
                 def fire(t=target):
                     held.discard(t)
+                    log(f"btn {t} up")
                     send(f"release {t}")
                 btn_delayed.schedule(target, fire, BTN_HOLD)
         else:
@@ -204,9 +256,34 @@ def main():
           "device_events": (0, 0),
           "errors": (0, 0),
           "client_started": False, "client_died": False}])
-    print(f"keymapd: mapping keyboard on {disp.get_display_name()} -> {FIFO}",
-          flush=True)
-    disp.record_enable_context(ctx, handler)  # blocks, delivers events
+    log(f"mapping keyboard on {disp.get_display_name()} -> {FIFO}")
+    disp.record_enable_context(ctx, handler)
+    log("RECORD context ended (X connection closed)")
+
+
+def main():
+    threading.Thread(target=writer_loop, daemon=True).start()
+    hat = HatState()
+    held = set()
+    btn_delayed = Delayed()
+    while True:
+        try:
+            tap_once(hat, held, btn_delayed)
+        except KeyboardInterrupt:
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            log(f"X error: {e}")
+        # Whatever just happened: never leave the pad in a held state, and
+        # drop key tracking that may have missed releases during the gap.
+        for t in list(held):
+            btn_delayed.cancel(t)
+            send(f"release {t}")
+        held.clear()
+        hat.reset()
+        log("reconnecting to X in 1s ...")
+        time.sleep(1)
 
 
 if __name__ == "__main__":

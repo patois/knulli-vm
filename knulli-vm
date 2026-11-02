@@ -207,12 +207,30 @@ cmd_status() {
         printf "  joypad:  "; pgrep -f "virtual_joypad[.]py" >/dev/null && echo up || echo down
         printf "  display: "; pgrep -x Xvfb >/dev/null && echo ":1 up" || echo down
         printf "  vnc:     "; pgrep -x x11vnc >/dev/null && echo ":5901 up" || echo down
+        printf "  keymap:  "; pgrep -f "keymapd[.]py" >/dev/null && echo "keyboard->pad up" || echo "DOWN (knulli-vm keymap restart)"
         printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
     printf "  audio:   "; audio_running >/dev/null && echo "streaming to Mac (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming"
     echo "  apps:"; (cmd_app list) | sed 's/^/    /'
 }
 
 cmd_vnc() { echo "vnc://localhost:5901  (password: ${VNC_PASS:-knulli})"; }
+
+# The VNC keyboard -> pad mapper (keymapd.py). If keys stop mapping on the
+# VNC screen, restart it here and read its per-key log.
+cmd_keymap() {
+    case "${1:-status}" in
+        restart)
+            # the ( ... & ) subshell detaches from the ssh session; a plain
+            # trailing & dies with it when limactl's ssh tears down the pgid
+            gexec 'sudo pkill -f "keymapd[.]py" 2>/dev/null; sleep 0.5
+                   (sudo DISPLAY=:1 setsid nohup python3 ~/knulli-vm/keymapd.py >/tmp/keymap.log 2>&1 </dev/null &)
+                   sleep 1.5
+                   pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd restarted" || { echo "FAILED to start keymapd:"; tail -5 /tmp/keymap.log; }';;
+        log) gexec 'tail -40 /tmp/keymap.log';;
+        status) gexec 'pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd up (VNC keyboard maps to the pad)" || echo "keymapd DOWN — run: knulli-vm keymap restart"';;
+        *) die "keymap: restart|log|status";;
+    esac
+}
 
 cmd_input() {
     [ -n "${1:-}" ] || die "input: give a FIFO command, e.g. knulli-vm input 'hat down 150'"
@@ -297,6 +315,7 @@ case "${1:-help}" in
     stop) cmd_stop;;
     status) cmd_status;;
     vnc) cmd_vnc;;
+    keymap) shift; cmd_keymap "${1:-status}";;
     input) shift; cmd_input "$*";;
     screenshot|shot) shift; cmd_screenshot "$@";;
     bridge) cmd_bridge;;
@@ -323,6 +342,9 @@ knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
                                 q/e=L1/R1, z/c=L2/R2, Enter=Start,
                                 BackSpace=Select, m=MENU, F1/F2=tabs)
   knulli-vm audio start|stop    pipe guest audio to the Mac (auto by start)
+  knulli-vm keymap restart      VNC keyboard mapper: restart|status|log
+                                (if WASD/arrows stop mapping on the VNC
+                                screen, this fixes it in one second)
   knulli-vm bridge              feed a physical USB/BT pad (plugged into Mac)
   knulli-vm app add SRC [--name N] [--cmd C] [--default]
   knulli-vm app rm NAME | app list | app default NAME

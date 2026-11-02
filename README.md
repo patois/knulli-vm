@@ -171,9 +171,16 @@ bin/                    built host binaries (gitignored)
   killed the pipe mid-session, `knulli-vm audio start` (or restart the app).
 - **`arecord` says "Device or resource busy"** — an orphaned capture from a
   previous session holds the loopback: `knulli-vm audio stop` then `start`.
-- **Keyboard does nothing on the VNC display** — no window manager exists, so
-  `focusd.sh` (started by the launcher) keeps focus on the app window; check
-  `pgrep -f focusd` and `/tmp/focusd.log` in the guest.
+- **Keyboard does nothing on the VNC display** — `./knulli-vm keymap restart`
+  first: that's the mapper (`keymapd.py`) being down or deaf, and it's a
+  one-second fix; `./knulli-vm keymap log` then shows every mapped key it
+  receives (if the log scrolls while you type but the app doesn't react,
+  the problem is the joypad/app side, not the keyboard). Still nothing?
+  No window manager exists, so `focusd.sh` (started by the launcher) keeps
+  focus on the app window; check `pgrep -f focusd` and `/tmp/focusd.log`
+  in the guest. (keymapd is now self-healing — it never blocks its X event
+  thread on the joypad FIFO and reconnects if the X connection dies — but
+  an old-style deaf instance from before that fix needs one restart.)
 - **VNC shows an auth error before the password prompt** — modern macOS
   Screen Sharing refuses auth-less servers; always start x11vnc with
   `-passwd`.
