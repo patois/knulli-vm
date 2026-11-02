@@ -8,8 +8,7 @@ translated into virtual_joypad.py FIFO commands over one persistent ssh pipe.
 Buttons/hat are edge-triggered, so held inputs stay held in the VM and the
 app's own repeat profiles do the rest — navigation feels native.
 
-Usage:  ~/projects/priv/grainbrick-run/padenv/bin/python \
-            ~/projects/priv/grainbrick-run/vm/pad_bridge.py [vm-name]
+Usage:  knulli-vm bridge          (runs this with the configured VM name)
 """
 import os
 import subprocess
@@ -32,16 +31,22 @@ VM = sys.argv[1] if len(sys.argv) > 1 else "grainbrick"
 FIFO = "/tmp/joypad.fifo"
 STICK_DZ = 0.5
 
-# SDL standard game-controller button indices (Xbox layout, what virtually
-# every USB/BT pad reports through the Game Controller framework) mapped to
-# the TrimUI Brick button names the app uses.
+# Button indices measured from the user's pad by a full press sweep
+# (2026-11-02): a USB pad spoofing Microsoft 045E:028E (Xbox 360) but
+# presenting a nonstandard raw HID order — 17 buttons, 6 axes, 0 hats,
+# dpad as plain buttons. Do NOT assume the SDL/Xbox standard order here:
+# that assumption shipped wrong dpad/button mapping until measured.
+# Axes: 0/1 = left stick, 3/4 = right stick, 2/5 = analog LT/RT (they
+# move together with digital buttons 13/16 — ignore the axes, the
+# buttons carry the edge).
 BUTTON_MAP = {
-    0: "SOUTH", 1: "EAST", 2: "WEST", 3: "NORTH",
-    4: "TL", 5: "TR", 6: "SELECT", 7: "START", 8: "MODE",
-    9: "THUMBL", 10: "THUMBR",
+    0: "A", 5: "B", 1: "X", 6: "Y",          # face (bottom, right, left, top)
+    11: "L1", 14: "R1", 13: "L2", 16: "R2",  # shoulders
+    4: "SELECT", 3: "START", 12: "MODE",     # small buttons (Guide -> MODE)
 }
-# Some HID pads report the dpad as extra buttons instead of a hat:
-HAT_BUTTONS = {12: "up", 13: "down", 14: "left", 15: "right"}
+# dpad arrives as buttons, not a hat (order probed: press up/down/left/
+# right hit 10/7/8/9; diagonals were exactly the pairwise sums).
+DPAD_BUTTONS = {10: "up", 7: "down", 8: "left", 9: "right"}
 HAT_DIR = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
 
 
@@ -58,7 +63,6 @@ class FifoPipe:
                 ["limactl", "shell", VM, "--", "sudo", "tee", FIFO],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
-            self._sent_hat = None  # fresh pipe: VM state unknown, resync
         try:
             self.proc.stdin.write((line + "\n").encode())
             self.proc.stdin.flush()
@@ -66,18 +70,25 @@ class FifoPipe:
             self.proc = None
 
 
-def read_hat(j):
-    """Logical dpad direction: real hat first, then dpad-as-buttons, then stick."""
+def read_hat(j, latched):
+    """Logical dpad direction: real hat first, then dpad-as-buttons, then stick.
+
+    latched is a persistent list of currently-held dpad button indices in
+    press order; the NEWEST held one wins on diagonals (a plain scan order
+    would pin the dpad to whichever index happens to be lowest)."""
     try:
         hx, hy = j.get_hat(0)
-        for name, (dx, dy) in HAT_DIR.items():
-            if (hx, hy) == (dx, dy):
-                return name
+        if (hx, hy) != (0, 0):
+            for name, (dx, dy) in HAT_DIR.items():
+                if (hx, hy) == (dx, dy):
+                    return name
     except Exception:
         pass
-    for b, name in HAT_BUTTONS.items():
-        if b < j.get_numbuttons() and j.get_button(b):
-            return name
+    held = [b for b in DPAD_BUTTONS if b < j.get_numbuttons() and j.get_button(b)]
+    latched[:] = [b for b in latched if b in held]          # released
+    latched += [b for b in held if b not in latched]        # newly pressed
+    if latched:
+        return DPAD_BUTTONS[latched[-1]]
     if j.get_numaxes() >= 2:
         lx, ly = j.get_axis(0), j.get_axis(1)  # ly: -1 = up
         if abs(lx) > STICK_DZ and abs(lx) >= abs(ly):
@@ -87,7 +98,7 @@ def read_hat(j):
     return None
 
 
-def poll_pad(j, pipe, held_btn, sent_hat):
+def poll_pad(j, pipe, held_btn, sent_hat, latched):
     for b, name in BUTTON_MAP.items():
         if b >= j.get_numbuttons():
             continue
@@ -98,7 +109,7 @@ def poll_pad(j, pipe, held_btn, sent_hat):
         elif not down and b in held_btn:
             pipe.send(f"release {name}")
             held_btn.discard(b)
-    hat = read_hat(j)
+    hat = read_hat(j, latched)
     if hat != sent_hat:
         pipe.send(f"holdhat {hat}" if hat else "holdhat none")
         sent_hat = hat
@@ -111,7 +122,7 @@ def main():
     pipe = FifoPipe()
     print("waiting for a gamepad (any USB/BT pad the Mac sees)...", flush=True)
     j = None
-    held_btn, sent_hat = set(), None
+    held_btn, sent_hat, latched = set(), None, []
     while True:
         pygame.event.pump()  # let SDL/GCController deliver connect events
         if j is None:
@@ -123,15 +134,15 @@ def main():
             print(f"connected: {j.get_name()!r} "
                   f"({j.get_numbuttons()} btn, {j.get_numhats()} hat, "
                   f"{j.get_numaxes()} axes)", flush=True)
-            held_btn, sent_hat = set(), None
+            held_btn, sent_hat, latched = set(), None, []
         try:
-            sent_hat = poll_pad(j, pipe, held_btn, sent_hat)
+            sent_hat = poll_pad(j, pipe, held_btn, sent_hat, latched)
         except Exception:  # device unplugged mid-poll
             print("pad disconnected", flush=True)
             for b in held_btn:
                 pipe.send(f"release {BUTTON_MAP[b]}")
             pipe.send("holdhat none")
-            j, held_btn, sent_hat = None, set(), None
+            j, held_btn, sent_hat, latched = None, set(), None, []
             continue
         time.sleep(0.012)  # ~80 Hz: below SDL poll interval, cheap over ssh
 
