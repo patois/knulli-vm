@@ -34,24 +34,44 @@ pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
     sudo DISPLAY=:1 nohup python3 "$G/keymapd.py" > /tmp/keymap.log 2>&1 &
     sleep 1
 }
-pgrep -x Xvfb >/dev/null 2>&1 || (Xvfb :1 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & sleep 1)
-# (re)start x11vnc unless one is ALREADY running with our password. x11vnc
-# scrubs -passwd from its own /proc cmdline, so we track our launches with a
-# hash marker; a running server without a matching marker (foreign instance
-# from a manual setup, or a changed --vnc-pass) gets replaced. A stale
-# marker for a dead server is fine — the pgrep gate catches that.
-MARK=/tmp/knulli-x11vnc.passwd-md5
+# Display + VNC: prefer TigerVNC's Xvnc (X server and VNC server in one,
+# modern input pipeline) over Xvfb+x11vnc. x11vnc starves its client input
+# queue while diffing the framebuffer (Recv-Q grew unboundedly under
+# animation — 742KB->1.6MB measured — so keyboard/mouse arrive seconds
+# late); Xvnc processes input on its own event loop, no second server,
+# no diff loop. Ubuntu's tigervnc package has no x0vncserver (serve-existing
+# -display mode is not built), so we move the display to Xvnc instead of
+# mirroring Xvfb.
+MARK=/tmp/knulli-vnc.passwd-md5
 want=$(printf '%s' "$VNC_PASS" | md5sum | cut -d' ' -f1)
-if pgrep -x x11vnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
-    x_ok=1
+if command -v Xvnc >/dev/null 2>&1; then
+    if pgrep -x Xvnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
+        :
+    else
+        pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null; sleep 1
+        rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
+        printf '%s\n%s\n' "$VNC_PASS" "$VNC_PASS" | vncpasswd -f > /tmp/knulli-vnc.pass
+        chmod 600 /tmp/knulli-vnc.pass
+        (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport 5901 \
+            -SecurityTypes VncAuth -PasswordFile /tmp/knulli-vnc.pass \
+            -AlwaysShared -localhost yes > /tmp/xvnc.log 2>&1 &)
+        sleep 2
+        echo "$want" > "$MARK"
+    fi
 else
-    x_ok=0
-fi
-if [ "$x_ok" = 0 ]; then
-    pkill -x x11vnc 2>/dev/null; sleep 1
-    x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
-        -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1
-    echo "$want" > "$MARK"
+    # fallback: Xvfb + x11vnc (laggy input, see comment above)
+    pgrep -x Xvfb >/dev/null 2>&1 || (Xvfb :1 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & sleep 1)
+    if pgrep -x x11vnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
+        x_ok=1
+    else
+        x_ok=0
+    fi
+    if [ "$x_ok" = 0 ]; then
+        pkill -x x11vnc 2>/dev/null; sleep 1
+        x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
+            -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1
+        echo "$want" > "$MARK"
+    fi
 fi
 
 # stop a previously launched app (sudo forwards SIGTERM into the chroot)

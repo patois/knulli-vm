@@ -206,7 +206,7 @@ cmd_status() {
     gexec '
         printf "  joypad:  "; pgrep -f "virtual_joypad[.]py" >/dev/null && echo up || echo down
         printf "  display: "; pgrep -x Xvfb >/dev/null && echo ":1 up" || echo down
-        printf "  vnc:     "; pgrep -x x11vnc >/dev/null && echo ":5901 up" || echo down
+        printf "  vnc:     "; if pgrep -x Xvnc >/dev/null; then echo "Xvnc :5901 up"; elif pgrep -x x11vnc >/dev/null; then echo "x11vnc :5901 up"; else echo down; fi
         printf "  keymap:  "; pgrep -f "keymapd[.]py" >/dev/null && echo "keyboard->pad up" || echo "DOWN (knulli-vm keymap restart)"
         printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
     printf "  audio:   "; audio_running >/dev/null && echo "streaming to Mac (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming"
@@ -222,7 +222,11 @@ cmd_keymap() {
         restart)
             # the ( ... & ) subshell detaches from the ssh session; a plain
             # trailing & dies with it when limactl's ssh tears down the pgid
-            gexec 'sudo pkill -f "keymapd[.]py" 2>/dev/null; sleep 0.5
+            # $ anchor: the real process cmdline ends with keymapd.py, while
+            # this very bash -lc string contains both "keymapd[.]py" and the
+            # launch path — an unanchored pattern makes pkill kill its own
+            # ssh session (exit 255, keymapd never restarts)
+            gexec 'sudo pkill -f "keymapd[.]py$" 2>/dev/null; sleep 0.5
                    (sudo DISPLAY=:1 setsid nohup python3 ~/knulli-vm/keymapd.py >/tmp/keymap.log 2>&1 </dev/null &)
                    sleep 1.5
                    pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd restarted" || { echo "FAILED to start keymapd:"; tail -5 /tmp/keymap.log; }';;

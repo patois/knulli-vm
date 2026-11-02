@@ -282,8 +282,15 @@ def main():
             send(f"release {t}")
         held.clear()
         hat.reset()
-        log("reconnecting to X in 1s ...")
+        # Do NOT reconnect by calling display.Display() again in this
+        # process: after a connection dies, python-xlib carries dead state
+        # (observed against a replaced X server: a fresh process maps
+        # instantly, the reconnecting one loops forever with "'type' object
+        # does not support item assignment"). Re-exec ourselves instead —
+        # a clean interpreter is the only reconnect that has ever worked.
+        log("restarting interpreter in 1s ...")
         time.sleep(1)
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
 
 if __name__ == "__main__":
