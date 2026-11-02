@@ -97,10 +97,15 @@ buttons. At the SDL layer it's indistinguishable from the onboard pad:
 ./knulli-vm bridge                      # physical USB/BT pad plugged into the Mac
 ```
 
-`bridge` reads the pad via pygame-ce (macOS Game Controller framework) and
-streams held button/dpad states into the VM over one ssh pipe — the app's own
-repeat profiles then behave natively. (USB *passthrough* isn't possible:
-Lima/vz exposes no USB, and Virtualization.framework's gamepad support is nil.)
+`bridge` reads the pad with pygame-ce/SDL2 on the Mac and streams held
+button/dpad states into the VM over one ssh pipe — the app's own repeat
+profiles then behave natively. (USB *passthrough* isn't possible: Lima/vz
+exposes no USB, and Virtualization.framework's gamepad support is nil. The
+bridge deliberately runs SDL's default *cocoa* video driver: the dummy
+driver never pumps the Cocoa runloop that delivers pad-connect callbacks, so
+an already-plugged pad stayed invisible until replug.) Button indices come
+from a measured sweep of the real pad, not the assumed "standard" order —
+see **Remapping inputs**.
 
 **Keyboard.** While the VNC window has Mac keyboard focus, the keys are
 mapped to the pad too (`lib/guest/keymapd.py` taps X11 globally without
@@ -144,6 +149,68 @@ meant hours of "the app outputs pure silence" while an orphaned app instance
 held sub0 in XRUN and real audio flowed on sub3, unseen. Latency is tuned for
 playability: `arecord -B 100000 -F 25000` (100 ms buffer / 25 ms periods) and
 25 ms CoreAudio chunks in `audioplay`, end-to-end ≈ 80–100 ms behind the VM.
+
+## Remapping inputs
+
+Both input paths feed one vocabulary — the `retrogame_joypad` FIFO's button
+names (`A B X Y L1 R1 L2 R2 SELECT START MODE TAB- TAB+`) and hat directions
+(`up down left right`, diagonals spelled `upleft` etc.) — so remapping is
+always "edit one small dict, restart its mapper".
+
+**Keyboard (VNC window)** — the map lives in `lib/guest/keymapd.py`,
+dict `KEYMAP`: keysym → `("btn", NAME)` or `("hat", DIR)` (default table
+above, mirroring the Brick panel; two keys can share a button, like
+`u`/`x` → X). Apply edits with:
+
+```sh
+./knulli-vm sync && ./knulli-vm keymap restart   # redeploy guest scripts, restart mapper
+./knulli-vm keymap log                           # logs every mapped key press it sees
+```
+
+If the app misses quick taps, raise `BTN_HOLD`/`HAT_HOLD` in the same file
+(the 120/220 ms floors are measured against GrainBrick: its buttons are
+event-driven and catch 80 ms taps, but it debounces hat steps under
+~200 ms). A held key machine-gunning instead of repeating means the floors
+are *too short* against your VNC's auto-repeat.
+
+**Physical pad (`knulli-vm bridge`)** — the map lives in
+`lib/host/pad_bridge.py`, dicts `BUTTON_MAP` (pygame button index → name)
+and `DPAD_BUTTONS` (index → direction; dpad arrives as buttons on some
+pads). The shipped values were measured on a specific pad and are correct
+for Xbox-order pads only by coincidence — **never copy an assumed standard
+order, sweep your own pad once:**
+
+```sh
+./padenv/bin/python -I - <<'PY'   # press every button/stick once; prints changes
+import os, time; os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+import pygame; pygame.display.init(); pygame.joystick.init()
+while pygame.joystick.get_count() == 0: pygame.event.pump(); time.sleep(0.1)
+j = pygame.joystick.Joystick(0)
+pb, pa = [0]*j.get_numbuttons(), [0.0]*j.get_numaxes()
+print(f"{j.get_name()!r}: {j.get_numbuttons()} btn {j.get_numaxes()} ax {j.get_numhats()} hat", flush=True)
+while True:
+    pygame.event.pump()
+    for b in range(j.get_numbuttons()):
+        v = j.get_button(b)
+        if v != pb[b]: print(f"BUTTON {b} {'down' if v else 'up'}", flush=True); pb[b] = v
+    for a in range(j.get_numaxes()):
+        v = j.get_axis(a)
+        if (v > 0.4) != (pa[a] > 0.4) or (v < -0.4) != (pa[a] < -0.4):
+            print(f"AXIS {a} {v:+.2f}", flush=True); pa[a] = v
+    time.sleep(0.02)
+PY
+```
+
+Press dpad directions (including diagonals), every button, both sticks.
+Two tells beat guessing when reading the log: an analog trigger moves its
+axis *together with* its digital button (that is how L2/R2 were pinned on
+this pad — buttons 13/16 dragged axes 2/5), and dpad diagonals fire as
+*pairs* of buttons, which proves the four dpad indices even when the
+direction labels are in question. Pads spoofing Microsoft's `045E:028E`
+are the cautionary case: they may enumerate 17 buttons / 6 axes / 0 hats
+in their own raw order, dpad-as-buttons included. Edit the dicts, then
+just rerun `./knulli-vm bridge` — it runs on the Mac, no `sync` needed.
+Pads with no dpad at all fall back to left-stick axes 0/1 automatically.
 
 ## Layout
 
