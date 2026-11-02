@@ -2,8 +2,10 @@
 # In-guest: extract the KNULLI OS userspace from a device image into a
 # chrootable rootfs. Image layout (GPT): protective MBR; partition table
 # entries carry firstLBA at entry offset **32** (not 16 — common gotcha);
-# a FAT32 "boot-resource" partition holds boot/knulli = a zstd squashfs
-# containing the entire OS.
+# a FAT32 "boot-resource" partition holds the OS squashfs (zstd) under
+# boot/ — named boot/knulli on scarab-era images, boot/batocera on the
+# older batocera-fork-era builds (gladiator-ii et al.), hence the
+# candidate list + magic-scan fallback below.
 #   usage: extract_knulli.sh <image-path> <dest-dir>
 set -euo pipefail
 IMG="$1"; DEST="$2"
@@ -65,8 +67,23 @@ MNT=$($SUDO mktemp -d /mnt/knulli-br.XXXXXX)   # /mnt is root-writable only
 umount_br() { $SUDO umount "$MNT" 2>/dev/null || true; $SUDO rmdir "$MNT" 2>/dev/null || true; }
 trap umount_br EXIT
 $SUDO mount -o ro,loop,offset="$OFF" "$IMG" "$MNT"
-SQ="$MNT/boot/knulli"
-[ -r "$SQ" ] || { echo "boot/knulli squashfs not found in boot-resource" >&2; exit 1; }
+# Try the known names across knulli eras first; then fall back to scanning
+# every file for the squashfs magic (hsqs), largest match wins — so a future
+# rename cannot strand the extractor.
+SQ=""
+for cand in knulli batocera knulli.update batocera.update; do
+    [ -f "$MNT/boot/$cand" ] && { SQ="$MNT/boot/$cand"; break; }
+done
+if [ -z "$SQ" ]; then
+    best=0
+    while IFS= read -r f; do
+        [ "$($SUDO head -c4 "$f" 2>/dev/null)" = hsqs ] || continue
+        sz=$($SUDO stat -c%s "$f")
+        [ "$sz" -gt "$best" ] && { SQ="$f"; best=$sz; }
+    done < <($SUDO find "$MNT" -type f 2>/dev/null)
+fi
+[ -n "$SQ" ] || { echo "no OS squashfs in boot-resource (tried boot/knulli, boot/batocera, .update variants, magic scan)" >&2; exit 1; }
+echo "OS squashfs: ${SQ#"$MNT"}"
 TMP_SQ="$HOME/knulli.sqsh"
 echo "copying squashfs ($(stat -c%s "$SQ") bytes) ..."
 $SUDO install -m 644 -o "$(id -u)" -g "$(id -g)" "$SQ" "$TMP_SQ"
