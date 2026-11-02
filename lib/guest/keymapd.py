@@ -7,12 +7,20 @@ retrogame_joypad commands on the virtual_joypad FIFO. Needs python3-xlib
 in the *guest* (apt install python3-xlib) and write access to the FIFO
 (run it with sudo, like virtual_joypad.py).
 
-Default map (keyboard is not grabbed, so both paths work at once):
-  W/S/A/D + arrows   dpad (diagonals by combining, e.g. W+A -> upleft)
-  J K U I            A(south) B(east) X(west) Y(north)
-  Q E                L / R
-  Enter              START        BackSpace  SELECT      m  MODE
-  Z C                stick clicks L3 / R3
+Default map mirrors the TRIMUI BRICK's physical buttons (see README):
+
+    dpad            W/S/A/D + arrow keys (diagonals combine: W+A -> upleft)
+    A  (right)      j                 B  (bottom)   k
+    X  (top)        u or x            Y  (left)     i
+    L1 / L2         q / z             R1 / R2       e / c
+    SELECT          BackSpace         START         Enter or space
+    MENU (logo)     m                 -> BTN_MODE
+
+  The Brick has no analog sticks, so L3/R3 keys do not exist; Z/C drive the
+  rear L2/R2 triggers instead. FN/F1/F2 are NOT joystick events on the real
+  device either — they are a gpio-keys keyboard; here the raw VNC keyboard
+  already delivers F1/F2 to the app as plain key presses, and FN (a
+  hotkey-mode toggle for OS shortcuts) has no meaning for apps.
 """
 import os
 import sys
@@ -25,18 +33,28 @@ from Xlib.protocol import rq
 
 FIFO = os.environ.get("JOYPAD_FIFO", "/tmp/joypad.fifo")
 
-# keysym -> ("btn", NAME) or ("hat", DIR)
+# keysym -> ("btn", NAME) or ("hat", DIR); names = virtual_joypad device
+# vocabulary (A B X Y L1 R1 L2 R2 SELECT START MODE TAB-/TAB+)
 KEYMAP = {
+    # dpad (two hands' worth, like the device's physical dpad)
     XK.XK_w: ("hat", "up"), XK.XK_s: ("hat", "down"),
     XK.XK_a: ("hat", "left"), XK.XK_d: ("hat", "right"),
     XK.XK_Up: ("hat", "up"), XK.XK_Down: ("hat", "down"),
     XK.XK_Left: ("hat", "left"), XK.XK_Right: ("hat", "right"),
-    XK.XK_j: ("btn", "SOUTH"), XK.XK_k: ("btn", "EAST"),
-    XK.XK_x: ("btn", "WEST"), XK.XK_i: ("btn", "NORTH"),
-    XK.XK_q: ("btn", "TL"), XK.XK_e: ("btn", "TR"),
+    # face buttons, by the Brick's printed letters
+    XK.XK_j: ("btn", "A"), XK.XK_k: ("btn", "B"),
+    XK.XK_u: ("btn", "X"), XK.XK_x: ("btn", "X"),
+    XK.XK_i: ("btn", "Y"),
+    # shoulder buttons: L1/R1 top row, L2/R2 bottom row (no sticks on the
+    # Brick, so z/c are free for the rear triggers)
+    XK.XK_q: ("btn", "L1"), XK.XK_e: ("btn", "R1"),
+    XK.XK_z: ("btn", "L2"), XK.XK_c: ("btn", "R2"),
+    # small buttons
     XK.XK_Return: ("btn", "START"), XK.XK_space: ("btn", "START"),
     XK.XK_BackSpace: ("btn", "SELECT"), XK.XK_m: ("btn", "MODE"),
-    XK.XK_z: ("btn", "THUMBL"), XK.XK_c: ("btn", "THUMBR"),
+    # F1/F2 are joystick TAB-/TAB+ on the real device (the driver maps the
+    # two bottom keys onto stick-click codes), so mirror them here too
+    XK.XK_F1: ("btn", "TAB-"), XK.XK_F2: ("btn", "TAB+"),
 }
 
 _fd = None
@@ -61,7 +79,16 @@ def send(line):
     print(f"keymapd: cannot write {FIFO}", file=sys.stderr)
 
 
-MIN_HOLD = 0.35  # GrainBrick samples the pad slowly; ~sub-300ms taps vanish
+# Hold floors, measured against GrainBrick (empirically bracketed 2026-11-02):
+#  * BUTTONS are event-driven (JOYBUTTONDOWN/UP off the pygame queue): 80 ms
+#    FIFO taps register fine. The floor only needs to outlast XKB auto-repeat
+#    (a held key must stay ONE hold, not machine-gun taps) and VNC
+#    press+release pairs landing in the same frame.
+#  * HAT steps are debounced by the app: 150 ms hat taps vanish, 200 ms
+#    register (horizontal_hold_start/repeat logic in InputManager). 220 ms
+#    with margin. The old single 350 ms floor over-penalised both.
+BTN_HOLD = 0.12
+HAT_HOLD = 0.22
 
 
 class Delayed:
@@ -107,7 +134,7 @@ class HatState:
                 self.pressed.remove(d)
             self.update()
 
-        self.delayed.schedule(d, fire, MIN_HOLD)
+        self.delayed.schedule(d, fire, HAT_HOLD)
 
     def update(self):
         p = set(self.pressed)
@@ -152,7 +179,7 @@ def main():
                 def fire(t=target):
                     held.discard(t)
                     send(f"release {t}")
-                btn_delayed.schedule(target, fire, MIN_HOLD)
+                btn_delayed.schedule(target, fire, BTN_HOLD)
         else:
             hat.press(target) if pressed else hat.release(target)
 

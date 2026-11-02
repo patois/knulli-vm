@@ -191,7 +191,8 @@ cmd_start() {
     fi
     echo "  VNC:  open vnc://localhost:5901   (password: ${VNC_PASS:-knulli})"
     echo "  input: knulli-vm input 'hat down 150'   |   knulli-vm bridge (physical pad)"
-    echo "         keyboard on the VNC screen: WASD/arrows = dpad, JKUI = ABXY"
+    echo "         keyboard on the VNC screen: WASD/arrows=dpad j=A k=B u/x=X i=Y"
+    echo "         q/e=L1/R1 z/c=L2/R2 Enter=Start Bksp=Select F1/F2=tabs"
     (cmd_audio start) || echo "  (audio could not start — retry: knulli-vm audio start)"
 }
 
@@ -252,7 +253,10 @@ cmd_audio() {
                 xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
                     || die "audioplay build failed (need xcrun swiftc: xcode-select --install)"
             fi
-            nohup bash -c "limactl shell '$VM' -- sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c 2 -t raw -q 2>/dev/null | '$AUDIO_BIN' 48000 2" \
+            # -B/-F are microseconds: 100 ms buffer / 25 ms periods keeps the
+            # loopback->ssh pipe flowing in small quanta (low latency) while
+            # staying far above the app's ~21 ms DSP blocks (no xruns).
+            nohup bash -c "limactl shell '$VM' -- sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c 2 -t raw -q -B 100000 -F 25000 2>/dev/null | '$AUDIO_BIN' 48000 2" \
                 >/dev/null 2>&1 &
             echo $! > "$AUDIO_PIDF"
             echo "audio: guest loopback -> Mac speakers (pid $!)"
@@ -281,7 +285,7 @@ cmd_bridge() {
 
 cmd_sync() {
     gexec "mkdir -p ~/knulli-vm"
-    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh; do
+    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh sdl_pad_probe.py; do
         limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
     done
     echo "guest scripts synced"
@@ -311,9 +315,13 @@ knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
   knulli-vm input "CMD"         gamepad FIFO: press|hold|release BUTTON,
                                 hat DIR [ms] (incl. diagonals), holdhat
                                 DIR|none, axis lx|ly V
+                                BUTTON: A B X Y L1 R1 L2 R2 SELECT START
+                                MODE TAB- TAB+ (aliases: F1/F2, SOUTH/EAST/
+                                NORTH/WEST/TL/TR/TL2/TR2 for host pads)
                                 (on the VNC screen the keyboard itself maps:
-                                WASD/arrows=dpad, JKUI=ABXY, QE=LR,
-                                Enter=Start BackSpace=Select m=Mode ZX=L3/R3)
+                                WASD/arrows=dpad, j=A k=B u/x=X i=Y,
+                                q/e=L1/R1, z/c=L2/R2, Enter=Start,
+                                BackSpace=Select, m=MENU, F1/F2=tabs)
   knulli-vm audio start|stop    pipe guest audio to the Mac (auto by start)
   knulli-vm bridge              feed a physical USB/BT pad (plugged into Mac)
   knulli-vm app add SRC [--name N] [--cmd C] [--default]

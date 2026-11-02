@@ -170,8 +170,9 @@ echo "knulli-vm ready."
 if [ -d "$STATE/$VM.apps" ] && [ -n "$(ls -A "$STATE/$VM.apps" 2>/dev/null)" ]; then
     echo "  ./knulli-vm start          # launch the default app (+ audio to Mac)"
     echo "  open \$(./knulli-vm vnc)   # VNC in (password: $VNC_PASS)"
-    echo "  keyboard on the VNC screen maps to the pad:"
-    echo "  WASD/arrows=dpad  JKUI=ABXY  QE=LR  Enter=Start  BackSpace=Select"
+    echo "  keyboard on the VNC screen maps to the Brick's buttons:"
+    echo "  WASD/arrows=dpad  j=A k=B u/x=X i=Y  q/e=L1/R1  z/c=L2/R2"
+    echo "  Enter=Start  BackSpace=Select  m=Menu  F1/F2=tabs"
 else
     echo "  no apps yet — e.g.:"
     echo "  ./knulli-vm app add /path/to/GrainBrick_beta_1.0_TrimUI_Brick_KNULLI.zip"

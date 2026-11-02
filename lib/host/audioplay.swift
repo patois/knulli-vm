@@ -26,7 +26,7 @@ guard status == noErr, let q = queue else {
 }
 AudioQueueStart(q, nil)
 
-let chunk = frameBytes * Int(rate) / 10          // 100 ms
+let chunk = frameBytes * Int(rate) / 40          // 25 ms (input latency; AudioQueue handles 40 bufs/s easily)
 let stdinHandle = FileHandle.standardInput
 while let data = try? stdinHandle.read(upToCount: chunk), !data.isEmpty {
     var buf: AudioQueueBufferRef?

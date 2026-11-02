@@ -6,7 +6,7 @@ retrogame_joypad) so SDL/pygame sees a "real" controller inside the VM.
 
 Usage: sudo python3 virtual_joypad.py [name]
 
-Commands via FIFO (echo "press SOUTH" > /tmp/joypad.fifo):
+Commands via FIFO (echo "press A" > /tmp/joypad.fifo):
   press BUTTON [ms]   tap button (default 80 ms)
   hold BUTTON         press and keep held
   release BUTTON      release a held button
@@ -15,7 +15,11 @@ Commands via FIFO (echo "press SOUTH" > /tmp/joypad.fifo):
   holdhat DIR         dpad held (repeat until 'holdhat none')
   holdhat none        release held dpad
   axis NAME VALUE     absolute stick: lx|ly  (-32767..32767)
-Buttons: SOUTH EAST NORTH WEST TL TR TL2 TR2 SELECT START MODE C Z THUMBL THUMBR
+
+Buttons use the TrimUI Brick's device vocabulary:
+  A B X Y  L1 R1  L2 R2  SELECT START MODE  TAB- TAB+   (+ F1/F2 aliases)
+Position aliases for host pads (Xbox-layout ergonomics): SOUTH=B(below),
+EAST=A(right), WEST=Y(left), NORTH=X(top), TL=L1, TR=R1, TL2=L2, TR2=R2.
 """
 import ctypes
 import fcntl
@@ -36,13 +40,35 @@ UI_DEV_DESTROY = 0x5502
 ABS_CNT = 64
 FIFO = os.environ.get("JOYPAD_FIFO", "/tmp/joypad.fifo")
 
-# Canonical Linux joystick button block (linux/input-event-codes.h),
-# BTN_A..BTN_THUMBR — the range SDL maps for game controllers
+# EXACT button set of the knulli rocknix-joypad driver on the TrimUI Brick
+# (reconstructed from GrainBrick's default ButtonMapping, which is a spec of
+# the real device: B=4 A=5 Y=6 X=7 L1=8 R1=9 L2=10 R2=11 SELECT=12 START=13
+# [14 unused] TAB-=15 TAB+=16 — and SDL numbers joystick buttons by
+# registration rank over evdev codes; verified empirically with
+# sdl_pad_probe.py). Consequences, all load-bearing:
+#   * four 0x120-block codes are registered first, occupying SDL indices 0-3;
+#   * face buttons are enumerated by position, NOT by kernel semantics:
+#     printed B (bottom)=0x130, A (right)=0x131, Y (left)=0x132 (BTN_C!),
+#     X (top)=0x133. The app's Y=6/X=7 defaults are only satisfiable this
+#     way — a kernel-correct BTN_WEST for the west button would put it at
+#     index 7 and swap the app's X/Y actions (the probe proves it);
+#   * 0x134/0x135 are NOT registered — registering them would shift L1/R1
+#     and everything after;
+#   * the Brick has no sticks: knulli repurposes the stick-click codes
+#     0x13D/0x13E for the TAB-/TAB+ keys (F1/F2).
 BTN = {
-    "SOUTH": 0x130, "EAST": 0x131, "C": 0x132, "NORTH": 0x133,
-    "WEST": 0x134, "Z": 0x135, "TL": 0x136, "TR": 0x137,
-    "TL2": 0x138, "TR2": 0x139, "SELECT": 0x13A, "START": 0x13B,
-    "MODE": 0x13C, "THUMBL": 0x13D, "THUMBR": 0x13E,
+    "TRIG": 0x120, "THUMB": 0x121, "THUMB2": 0x122, "TOP": 0x123,
+    "B": 0x130, "SOUTH": 0x130,
+    "A": 0x131, "EAST": 0x131,
+    "Y": 0x132, "WEST": 0x132,
+    "X": 0x133, "NORTH": 0x133,
+    "L1": 0x136, "TL": 0x136,
+    "R1": 0x137, "TR": 0x137,
+    "L2": 0x138, "TL2": 0x138,
+    "R2": 0x139, "TR2": 0x139,
+    "SELECT": 0x13A, "START": 0x13B, "MODE": 0x13C,
+    "TAB-": 0x13D, "THUMBL": 0x13D, "F1": 0x13D,
+    "TAB+": 0x13E, "THUMBR": 0x13E, "F2": 0x13E,
 }
 ABS_X, ABS_Y = 0x00, 0x01
 ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11

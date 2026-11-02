@@ -78,13 +78,22 @@ Re-adding an app name upgrades it in place while preserving the user's
 dir — same contract the app's own README promises for device upgrades.
 
 **Input.** The VM has an emulated `retrogame_joypad` — a uinput replica of
-knulli's `rocknix-joypad` kernel driver (same device name GrainBrick checks
-for, same evdev codes/hat axes), so it's indistinguishable from the onboard
-pad at the SDL layer:
+knulli's `rocknix-joypad` kernel driver **on the TrimUI Brick specifically**:
+same device name GrainBrick checks for, and the exact evdev code set the real
+driver registers (four 0x120-block codes first, then the face buttons
+*positionally* — printed B=BTN_SOUTH, A=BTN_EAST, X=BTN_NORTH, Y=BTN_WEST —
+L1–R2, SELECT/START/MODE, and the two stick-click codes 0x13D/0x13E
+repurposed as the Brick's TAB-/TAB+ keys, i.e. F1/F2; BTN_C/BTN_Z are *not*
+registered). SDL numbers joystick buttons by ascending code, so matching the
+set exactly is what makes the app's default mapping (B=4 A=5 Y=6 X=7 L1=8
+R1=9 L2=10 R2=11 SELECT=12 START=13 TAB-=15 TAB+=16) land on the right
+buttons. At the SDL layer it's indistinguishable from the onboard pad:
 
 ```sh
 ./knulli-vm input "hat down 150"        # tap; holdhat down / holdhat none for held
-./knulli-vm input "press SOUTH"
+./knulli-vm input "press Y"             # names: A B X Y L1 R1 L2 R2 SELECT
+                                        # START MODE TAB- TAB+ (F1/F2 and
+                                        # SOUTH/EAST/NORTH/WEST/TL/TR/... alias)
 ./knulli-vm bridge                      # physical USB/BT pad plugged into the Mac
 ```
 
@@ -95,17 +104,28 @@ Lima/vz exposes no USB, and Virtualization.framework's gamepad support is nil.)
 
 **Keyboard.** While the VNC window has Mac keyboard focus, the keys are
 mapped to the pad too (`lib/guest/keymapd.py` taps X11 globally without
-grabbing, so the app still sees raw keys if it wants them):
+grabbing, so the app still sees raw keys if it wants them). The map mirrors
+the Brick's own panel — dpad on the left, SNES-lettered face cluster on the
+right (X top, A right, B bottom, Y left), triggers under L1/R1:
 
-| keys | pad | keys | pad |
+| keys | Brick button | keys | Brick button |
 |---|---|---|---|
-| W A S D / arrows | dpad (diagonals combine) | Q / E | L / R |
-| J / K | A (south) / B (east) | Enter, space | START |
-| U / I | X (west) / Y (north) | BackSpace | SELECT |
-| Z / C | L3 / R3 | m | MODE |
+| W A S D / arrows | dpad (diagonals combine) | Q / E | L1 / R1 (shoulders) |
+| K | B (bottom) | Z / C | L2 / R2 (rear) |
+| J | A (right) | BackSpace | SELECT |
+| U or X | X (top) | Enter, space | START |
+| I | Y (left) | m | MENU (logo) |
+| F1 / F2 | TAB-/TAB+ (the Brick's F1/F2) | | |
 
-Fast taps are stretched to ≥350 ms — the app samples the pad slowly and
-sub-frame blips vanish — and auto-repeat is absorbed as a held key.
+The Brick has no analog sticks, so there is no L3/R3; FN is a gpio-keys OS
+hotkey modifier, not a joystick event, so it has no mapping (F1/F2 *are*
+joystick TAB-/TAB+ on the real device and are mapped as such, while also
+reaching the app as raw keys through the same passive tap).
+
+Fast taps are stretched to a minimum hold — **120 ms for buttons, 220 ms for
+dpad steps** (measured against GrainBrick: its buttons are event-driven and
+catch 80 ms taps, but it debounces hat steps under ~200 ms) — and keyboard
+auto-repeat is absorbed as a single held key.
 
 **Audio.** The guest has no sound device, so the chroot's ALSA `default` is
 routed into a `snd-aloop` loopback card (`lib/guest/setup_audio.sh`) and
@@ -114,7 +134,9 @@ over ssh into `bin/audioplay`, a tiny CoreAudio sink on the Mac. Two details
 that look wrong but are right: the aloop cables are *cross-wired* (default
 writes device 0 playback → host reads device 1 capture), and `snd-dummy`
 occupies card 0 on purpose because apps like GrainBrick open the mic as a
-hardcoded `hw:1,0` — card 1 must be the loopback card.
+hardcoded `hw:1,0` — card 1 must be the loopback card. Latency is tuned for
+playability: `arecord -B 100000 -F 25000` (100 ms buffer / 25 ms periods) and
+25 ms CoreAudio chunks in `audioplay`, end-to-end ≈ 80–100 ms behind the VM.
 
 ## Layout
 
