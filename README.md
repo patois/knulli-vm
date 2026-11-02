@@ -25,11 +25,19 @@ EmulationStation execs for pygame ports on the device), installed under
   floor knulli's pygame enforces ("SDL downgrade" check).
 - The app itself is never modified; run as distributed.
 
-## Requirements
+## Requirements — what to get and where from
 
-- Apple Silicon Mac, `brew install lima`, `python3`, `curl`.
-- Xcode Command Line Tools (`xcrun swiftc`) for the small host audio player;
-  everything still installs without it, you just get no sound.
+| piece | where |
+|---|---|
+| Apple Silicon Mac + Homebrew | <https://brew.sh> (`brew install lima`) |
+| Lima (VM host) | <https://github.com/lima-vm/lima> |
+| Xcode Command Line Tools | `xcode-select --install` (needed only for `swiftc` → the host audio player; everything else installs without it, you just get no sound) |
+| KNULLI image | **fetched automatically** by `install.sh` from the latest release of <https://github.com/knulli-cfw/distribution> (project site: <https://knulli.org>); manual download / other devices: pick the `.img.gz` asset whose prefix matches your device — e.g. `knulli-a133-trimui-brick-*.img.gz` for the original TrimUI Brick — and pass `--image` / `--image-device`. The device list lives on the releases page: <https://github.com/knulli-cfw/distribution/releases> |
+| TrimUI Brick hardware info / official firmware | <https://www.trimui.com> (KNULLI is the community replacement; the StockOS is TrimUI's own) |
+| Apps, e.g. GrainBrick | the app's own releases page — GrainBrick: <https://github.com/ETRNLIAM/GrainBrick/releases> (grab the release ZIP, not GitHub's "Source code" archives); then `./knulli-vm app add <zip-or-url>` |
+
+Nothing else needs downloading by hand: the Ubuntu arm64 VM image is pulled by
+Lima, and the SDL2 source by the installer.
 
 ## Install
 
