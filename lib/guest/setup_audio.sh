@@ -45,11 +45,16 @@ $SUDO tee "$R/etc/asound.conf" > /dev/null <<'EOF'
 # knulli-vm: send all audio to the loopback card; the Mac host captures
 # hw:Loopback,1,0 (same rate/format) and plays it. Do not edit the rate or
 # format without matching the host-side arecord invocation.
-# Note: with two aloop devices the cables are CROSS-wired — writes to device
-# 0's playback are readable at device 1's capture. That is intended: it also
-# leaves device 0's capture (what a hardcoded hw:1,0 "mic" opens) hearing
-# device 1's playback, which nothing writes to — a silent mic, like a device
-# with no mic input, instead of a feedback echo of the app's own output.
+# Device choice is load-bearing, and aloop's cable map is NOT what the docs
+# suggest: an empirical matrix (tone on each playback x capture on each
+# device, both start orders) proves that on this card device 0's PLAYBACK is
+# looped to device 1's CAPTURE (D0p -> D1c), and same-numbered pairs carry
+# nothing. So: apps write default -> device 0; the Mac reads hw:Loopback,1,0
+# — that is the live cable. Device 0's capture (what a hardcoded hw:1,0
+# "mic" opens) is fed by device 1's playback, which nothing writes: a silent
+# mic, like a device with no mic input, instead of a feedback echo of the
+# app's own output. Moving default to device 1 plugs the app into a dead
+# cable: full-rate clock-locked digital silence.
 pcm.!default {
     type plug
     slave {
@@ -62,4 +67,4 @@ pcm.!default {
 }
 ctl.!default { type hw; card Loopback }
 EOF
-echo "alsa default -> loopback (card Loopback,0) in $R/etc/asound.conf"
+echo "alsa default -> loopback (card Loopback,1) in $R/etc/asound.conf"
