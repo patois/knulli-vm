@@ -15,7 +15,20 @@ if ! $SUDO test -f /etc/modprobe.d/knulli-vm.conf; then
         | $SUDO tee /etc/modprobe.d/knulli-vm.conf >/dev/null
 fi
 $SUDO modprobe snd-dummy 2>/dev/null || true
-$SUDO modprobe snd-aloop 2>/dev/null || true
+if ! $SUDO modprobe snd-aloop 2>/dev/null; then
+    # Classic trap: unattended-upgrades installs a new kernel but NOT
+    # linux-modules-extra (where snd-aloop lives) for it. The VM then boots
+    # fine and everything looks up, but the loopback card simply doesn't
+    # exist and audio dies with only a WARN in the app log. Self-heal:
+    # install the extra-modules package matching the RUNNING kernel.
+    if [ -d "/lib/modules/$(uname -r)" ]; then
+        echo "snd-aloop missing for kernel $(uname -r); installing linux-modules-extra ..." >&2
+        $SUDO apt-get update -qq >/dev/null 2>&1 || true
+        $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
+        $SUDO modprobe snd-aloop 2>/dev/null || true
+    fi
+fi
 # /proc/asound/cards says "Loopback"; the module name is what to check
 grep -q snd_aloop /proc/modules || { echo "snd-aloop failed to load" >&2; exit 1; }
 if ! grep -q "^[[:space:]]*1 \[Loopback" /proc/asound/cards; then
