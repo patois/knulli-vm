@@ -26,7 +26,9 @@ while [ -z "$sub" ]; do
         echo "audio_capture: no live aplay playback stream appeared within ${AUDIO_WAIT:-90}s" >&2
         exit 1
     fi
-    for p in $(pgrep -x aplay 2>/dev/null); do
+    # newest aplay first (sort -n -r): if a stale instance's aplay ever
+    # lingers, its sub is XRUN-ish and the live app's is the higher pid
+    for p in $(pgrep -x aplay 2>/dev/null | sort -rn); do
         for s in /proc/asound/card"$CARD"/pcm0p/sub*; do
             owner=$(awk '/owner_pid/{print $3}' "$s/status" 2>/dev/null)
             [ "$owner" = "$p" ] || continue

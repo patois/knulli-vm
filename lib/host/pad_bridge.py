@@ -17,7 +17,13 @@ import sys
 import time
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-os.environ["SDL_VIDEODRIVER"] = "dummy"  # event pump needs *a* video driver; keep it headless
+# Do NOT set SDL_VIDEODRIVER=dummy: on macOS, SDL enumerates gamepads through
+# the Game Controller framework, whose connect callbacks run on the Cocoa run
+# loop — the dummy video driver never pumps that loop, so a pad that was
+# already plugged in stayed invisible (get_count()==0 forever) until an
+# unplug/replug generated a fresh hotplug event. The default cocoa driver
+# without any window is headless enough, and pygame.event.pump() then
+# attaches already-connected pads within ~1 s of startup.
 import pygame.joystick  # noqa: E402
 import pygame.display   # noqa: E402
 import pygame          # noqa: E402

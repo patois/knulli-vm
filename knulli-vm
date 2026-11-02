@@ -205,14 +205,20 @@ cmd_stop() {
     # audio_capture.sh). sudo: the tree runs as root inside the chroot.
     # The sweep patterns are bracketed so they cannot match this very
     # ssh command line.
+    # SIGTERM is NOT enough: the app installs signal handlers and survives
+    # it (observed — orphaned UI kept serving a respawned aplay), so every
+    # kill here is TERM, grace, then -9.
     gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); rm -f /tmp/knulli-app.pid
-        if [ -n "$p" ]; then
-            killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
-            killtree "$p"
-        fi
+        killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
+        [ -n "$p" ] && killtree "$p"
         sleep 1
+        killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill -9 "$1" 2>/dev/null; }
+        [ -n "$p" ] && killtree "$p"
         sudo pkill -f "gb_launch[.]py" 2>/dev/null
         sudo pkill -x aplay 2>/dev/null
+        sleep 1
+        sudo pkill -9 -f "gb_launch[.]py" 2>/dev/null
+        sudo pkill -9 -x aplay 2>/dev/null
         echo stopped'
 }
 

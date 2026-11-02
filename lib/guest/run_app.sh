@@ -42,21 +42,33 @@ pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
 # no diff loop. Ubuntu's tigervnc package has no x0vncserver (serve-existing
 # -display mode is not built), so we move the display to Xvnc instead of
 # mirroring Xvfb.
+# AcceptSetDesktopSize must be OFF: macOS Screen Sharing otherwise sends a
+# set-desktop-size request sized to its window, shrinking the framebuffer
+# under the app (1280x720 UI on a 1024x768 desktop = right/bottom of the
+# UI clipped away, "VNC cuts parts of the screen off"). The mark hashes the
+# password AND the Xvnc config version, so changing launch options below
+# forces a restart of a running-but-stale Xvnc.
 MARK=/tmp/knulli-vnc.passwd-md5
-want=$(printf '%s' "$VNC_PASS" | md5sum | cut -d' ' -f1)
+want=$(printf '%s|v4-nosetsize' "$VNC_PASS" | md5sum | cut -d' ' -f1)
 if command -v Xvnc >/dev/null 2>&1; then
     if pgrep -x Xvnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
         :
     else
-        pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null; sleep 1
+        # pkill Xvnc too: without it the replacement server dies with
+        # "Cannot establish any listening sockets" while the marker got
+        # written anyway — leaving the STALE server (old geometry/flags)
+        # masquerading as configured on every later start.
+        pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null
+        pkill -x Xvnc 2>/dev/null; sleep 1
         rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
         printf '%s\n%s\n' "$VNC_PASS" "$VNC_PASS" | vncpasswd -f > /tmp/knulli-vnc.pass
         chmod 600 /tmp/knulli-vnc.pass
         (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport 5901 \
             -SecurityTypes VncAuth -PasswordFile /tmp/knulli-vnc.pass \
-            -AlwaysShared -localhost yes > /tmp/xvnc.log 2>&1 &)
+            -AlwaysShared -localhost yes -AcceptSetDesktopSize=0 \
+            > /tmp/xvnc.log 2>&1 &)
         sleep 2
-        echo "$want" > "$MARK"
+        [ "$(pgrep -cx Xvnc)" = 1 ] && echo "$want" > "$MARK"
     fi
 else
     # fallback: Xvfb + x11vnc (laggy input, see comment above)
@@ -85,10 +97,18 @@ if [ -f "$PIDF" ]; then
         killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
         killtree "$OLD"
         sleep 1
+        # the app installs signal handlers and IGNORES SIGTERM — escalate
+        killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill -9 "$1" 2>/dev/null; }
+        killtree "$OLD"
         # (no name sweep here: our own cmdline carries the launch CMD
         # argument "gb_launch.py", so a pkill pattern would match us)
     fi
 fi
 
 echo $$ > "$PIDF"
-exec "$G/knulli-chroot.sh" "cd '$DIR' && exec $CMD"
+# SDL_VIDEO_X11_XRANDR=0: SDL's RandR fullscreen mode-switching reprograms
+# the Xvnc screen and leaves the desktop at 1024x768 (its built-in default)
+# — the app's 1280-wide fullscreen UI then hangs off the shrunken desktop,
+# clipped ("VNC cuts parts of the screen off"). With RandR switching off,
+# SDL fullscreen just uses the desktop size as-is.
+exec "$G/knulli-chroot.sh" "cd '$DIR' && exec env SDL_VIDEO_X11_XRANDR=0 $CMD"
