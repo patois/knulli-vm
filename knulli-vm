@@ -220,7 +220,7 @@ cmd_status() {
     limactl list | grep -E "NAME|$VM[[:space:]]" | head -2
     gexec '
         printf "  joypad:  "; pgrep -f "virtual_joypad[.]py" >/dev/null && echo up || echo down
-        printf "  display: "; pgrep -x Xvfb >/dev/null && echo ":1 up" || echo down
+        printf "  display: "; { pgrep -x Xvnc >/dev/null || pgrep -x Xvfb >/dev/null; } && echo ":1 up" || echo down
         printf "  vnc:     "; if pgrep -x Xvnc >/dev/null; then echo "Xvnc :5901 up"; elif pgrep -x x11vnc >/dev/null; then echo "x11vnc :5901 up"; else echo down; fi
         printf "  keymap:  "; pgrep -f "keymapd[.]py" >/dev/null && echo "keyboard->pad up" || echo "DOWN (knulli-vm keymap restart)"
         printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
