@@ -74,11 +74,20 @@ else
     fi
 fi
 
-# stop a previously launched app (sudo forwards SIGTERM into the chroot)
+# Stop a previously launched app — the WHOLE tree. A wrapper-only kill
+# orphans the app UI + audio pump + aplay at ppid=1, where they keep an
+# aloop substream and keep respawning their aplay, poisoning audio
+# capture for the new instance (see audio_capture.sh). Tree runs as
+# root inside the chroot, so kill with sudo.
 if [ -f "$PIDF" ]; then
     OLD=$(cat "$PIDF" 2>/dev/null)
-    [ -n "$OLD" ] && kill "$OLD" 2>/dev/null
-    sleep 1
+    if [ -n "$OLD" ]; then
+        killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
+        killtree "$OLD"
+        sleep 1
+        # (no name sweep here: our own cmdline carries the launch CMD
+        # argument "gb_launch.py", so a pkill pattern would match us)
+    fi
 fi
 
 echo $$ > "$PIDF"

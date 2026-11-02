@@ -198,7 +198,22 @@ cmd_start() {
 
 cmd_stop() {
     cmd_audio stop
-    gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f /tmp/knulli-app.pid; echo stopped'
+    # Kill the WHOLE tree, not just the wrapper pid: the app UI, its
+    # audio-pump child and aplay survive a wrapper-only kill as ppid=1
+    # orphans that keep hogging X, an aloop substream and CPU — and an
+    # orphan once made the live app's audio uncapturable (see
+    # audio_capture.sh). sudo: the tree runs as root inside the chroot.
+    # The sweep patterns are bracketed so they cannot match this very
+    # ssh command line.
+    gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); rm -f /tmp/knulli-app.pid
+        if [ -n "$p" ]; then
+            killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
+            killtree "$p"
+        fi
+        sleep 1
+        sudo pkill -f "gb_launch[.]py" 2>/dev/null
+        sudo pkill -x aplay 2>/dev/null
+        echo stopped'
 }
 
 cmd_status() {
@@ -275,10 +290,17 @@ cmd_audio() {
                 xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
                     || die "audioplay build failed (need xcrun swiftc: xcode-select --install)"
             fi
-            # -B/-F are microseconds: 100 ms buffer / 25 ms periods keeps the
-            # loopback->ssh pipe flowing in small quanta (low latency) while
-            # staying far above the app's ~21 ms DSP blocks (no xruns).
-            nohup bash -c "limactl shell '$VM' -- sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c 2 -t raw -q -B 100000 -F 25000 2>/dev/null | '$AUDIO_BIN' 48000 2" \
+            # audio_capture.sh (guest, as root) discovers WHICH aloop
+            # substream the app's aplay owns and captures that cable —
+            # a hardcoded subdevice captures whatever stale stream last
+            # held it (an orphaned app instance once made real audio
+            # look like pure silence for hours). -B/-F are microseconds:
+            # 100 ms buffer / 25 ms periods keeps the loopback->ssh pipe
+            # flowing in small quanta (low latency) while staying far
+            # above the app's ~21 ms DSP blocks (no xruns).
+            # bash -lc on the guest so ~ expands THERE (limactl's exec
+            # form spawns no guest shell; host-side $HOME would leak in)
+            nohup bash -c "limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_capture.sh 2>/dev/null' | '$AUDIO_BIN' 48000 2" \
                 >/dev/null 2>&1 &
             echo $! > "$AUDIO_PIDF"
             echo "audio: guest loopback -> Mac speakers (pid $!)"
@@ -307,7 +329,7 @@ cmd_bridge() {
 
 cmd_sync() {
     gexec "mkdir -p ~/knulli-vm"
-    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh sdl_pad_probe.py; do
+    for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py focusd.sh sdl_pad_probe.py audio_capture.sh; do
         limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
     done
     echo "guest scripts synced"
