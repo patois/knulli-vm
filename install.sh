@@ -24,6 +24,20 @@ VNC_PASS="knulli"; APPS=()
 die() { echo "install: $*" >&2; exit 1; }
 say() { echo ">>> $*"; }
 
+# heartbeat LABEL PID — prints an elapsed-time line every 15 s while PID
+# lives, then stops. The slow steps (unsquashfs, cmake, limactl boot) have
+# their verbose output silenced on purpose, which otherwise reads as a
+# hang on a first install; a ticking clock is the difference between
+# "working" and "frozen". Caller still collects the exit code with wait.
+heartbeat() {
+    local label="$1" pid="$2" t=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 15; t=$((t + 15))
+        kill -0 "$pid" 2>/dev/null || break
+        say "$label ... ${t}s"
+    done
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2;;
@@ -54,9 +68,11 @@ if ! limactl list --json 2>/dev/null | grep -q "\"name\":\"$VM\".*\"status\":\"R
     fi
     limactl start "$HERE/vm/knulli.yaml" --name "$VM" >/dev/null 2>&1 &
     SP=$!
+    tv=0
     for _ in $(seq 1 90); do
         limactl list --json 2>/dev/null | grep -q "\"name\":\"$VM\".*\"status\":\"Running\"" && break
-        sleep 5
+        sleep 5; tv=$((tv + 5))
+        [ $((tv % 30)) -eq 0 ] && say "waiting for VM to boot ... ${tv}s"
     done
     kill "$SP" 2>/dev/null
     limactl list | grep -q "^$VM[[:space:]].*Running" || \
@@ -65,11 +81,18 @@ fi
 say "VM '$VM' is up"
 
 # ---- 2. deploy guest scripts ---------------------------------------------------
+# Keep this list in sync with lib/guest/ (knulli-vm sync has its own copy of
+# the list): a missing entry silently breaks its feature on fresh installs —
+# audio_capture.sh absent meant "the app is silent" with every step green.
+# A failed copy must abort: printing "deployed" after failures sends you off
+# to debug the wrong machine.
 mkdir -p "$STATE"
 gexec "mkdir -p ~/knulli-vm"
 for f in knulli-chroot.sh virtual_joypad.py run_app.sh setup_audio.sh keymapd.py \
-         focusd.sh extract_knulli.sh build_sdl2_x11.sh; do
-    limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f"
+         focusd.sh extract_knulli.sh build_sdl2_x11.sh sdl_pad_probe.py audio_capture.sh; do
+    [ -f "$HERE/lib/guest/$f" ] || die "missing lib/guest/$f (corrupted checkout?)"
+    limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$f" < "$HERE/lib/guest/$f" \
+        || die "failed to deploy lib/guest/$f to the guest"
 done
 say "guest scripts deployed to ~/knulli-vm"
 
@@ -109,10 +132,15 @@ PY
         sha_url="$IMAGE_URL.sha256"
         if curl -fsL -o "$gz.sha256" "$sha_url" 2>/dev/null; then
             say "verifying sha256"
-            (cd "$DL" && shasum -a 256 -c "$(basename "$gz").sha256") || die "sha256 mismatch"
+            (cd "$DL" && shasum -a 256 -c "$(basename "$gz").sha256") & hp=$!
+            heartbeat "hashing 2 GB" $hp
+            wait $hp || die "sha256 mismatch"
         fi
         say "gunzip"
-        gunzip -c "$gz" > "$IMAGE" && rm -f "$gz" "$gz.sha256"
+        gunzip -c "$gz" > "$IMAGE" & hp=$!
+        heartbeat "gunzip" $hp
+        wait $hp || die "gunzip failed"
+        rm -f "$gz" "$gz.sha256"
     else
         say "image already present: $IMAGE"
     fi
@@ -121,13 +149,16 @@ say "image: $IMAGE"
 
 # ---- 4. extract the knulli rootfs ----------------------------------------------
 if [ -f "$IMAGE" ]; then
-    limactl shell "$VM" -- bash -lc "~/knulli-vm/extract_knulli.sh '$IMAGE' '$ROOTFS'" \
-        || die "rootfs extraction failed"
+    # </dev/null: a backgrounded ssh would SIGTTIN-stop on reading the tty
+    limactl shell "$VM" -- bash -lc "~/knulli-vm/extract_knulli.sh '$IMAGE' '$ROOTFS'" </dev/null & hp=$!
+    heartbeat "extracting rootfs (unsquashfs runs in the guest)" $hp
+    wait $hp || die "rootfs extraction failed"
 fi
 
 # ---- 5. SDL2 x11 compat build ---------------------------------------------------
-limactl shell "$VM" -- bash -lc "~/knulli-vm/build_sdl2_x11.sh '$ROOTFS'" \
-    || die "SDL2 x11-compat build failed"
+limactl shell "$VM" -- bash -lc "~/knulli-vm/build_sdl2_x11.sh '$ROOTFS'" </dev/null & hp=$!
+heartbeat "SDL2 x11 build (apt+cmake in guest)" $hp
+wait $hp || die "SDL2 x11-compat build failed"
 
 # ---- 5b. audio routing (loopback card -> Mac) -----------------------------------
 limactl shell "$VM" -- bash -lc "~/knulli-vm/setup_audio.sh '$ROOTFS'" \
@@ -152,8 +183,9 @@ if [ ! -x "$HERE/bin/audioplay" ]; then
     if command -v xcrun >/dev/null && xcrun --find swiftc >/dev/null 2>&1; then
         say "building host audio player (bin/audioplay)"
         mkdir -p "$HERE/bin"
-        xcrun swiftc -O -o "$HERE/bin/audioplay" "$HERE/lib/host/audioplay.swift" \
-            || say "WARNING: audioplay build failed — guest audio will be silent"
+        xcrun swiftc -O -o "$HERE/bin/audioplay" "$HERE/lib/host/audioplay.swift" & hp=$!
+        heartbeat "swiftc" $hp
+        wait $hp || say "WARNING: audioplay build failed — guest audio will be silent"
     else
         say "WARNING: no swiftc (xcode-select --install) — guest audio will be silent"
     fi
