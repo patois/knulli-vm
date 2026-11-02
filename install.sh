@@ -125,15 +125,47 @@ PY
     fi
     gz="$DL/$(basename "$IMAGE_URL")"
     IMAGE="${gz%.gz}"
+    # knulli's .sha256 release asset is a BARE hash (64 hex chars, no
+    # filename field) — `shasum -c` rejects that as "no properly formatted
+    # SHA checksum lines", which reads like a corrupt download and blocks
+    # every install. Compare the hash value itself; tolerate either format.
+    verify_gz() {
+        if ! curl -fsL -o "$gz.sha256" "${IMAGE_URL}.sha256" 2>/dev/null; then
+            say "WARNING: no .sha256 asset for this release — verification skipped"
+            return 0
+        fi
+        want=$(grep -oiE '[0-9a-f]{64}' "$gz.sha256" | head -1)
+        [ -n "$want" ] || { say "WARNING: unparsable .sha256 asset — verification skipped"; return 0; }
+        say "verifying sha256"
+        ( shasum -a 256 "$gz" > "$gz.have" ) & hp=$!
+        heartbeat "hashing 2 GB" $hp
+        wait $hp || { rm -f "$gz.have"; die "shasum failed"; }
+        have=$(awk '{print $1}' "$gz.have"); rm -f "$gz.have"
+        if [ "$have" != "$want" ]; then
+            say "sha256 MISMATCH: want $want"
+            say "                 have  $have"
+            return 1
+        fi
+        say "sha256 OK"
+    }
     if [ ! -f "$IMAGE" ]; then
-        say "downloading $IMAGE_URL (~2 GB)"
-        curl -fL -C - -o "$gz" "$IMAGE_URL" || die "download failed"
-        sha_url="$IMAGE_URL.sha256"
-        if curl -fsL -o "$gz.sha256" "$sha_url" 2>/dev/null; then
-            say "verifying sha256"
-            (cd "$DL" && shasum -a 256 -c "$(basename "$gz").sha256") & hp=$!
-            heartbeat "hashing 2 GB" $hp
-            wait $hp || die "sha256 mismatch"
+        if [ -f "$gz" ]; then
+            # A completed .gz from a previous run must be verified and
+            # REUSED, not re-fetched: curl -C - on a complete file gets
+            # HTTP 416 and dies "download failed" — a dead end after any
+            # earlier failure (like the sha-format bug).
+            if verify_gz; then
+                say "existing download verified — skipping re-download"
+            else
+                say "existing download failed verification — re-downloading"
+                rm -f "$gz" "$gz.sha256"
+                curl -fL -o "$gz" "$IMAGE_URL" || die "download failed"
+                verify_gz || die "sha256 mismatch"
+            fi
+        else
+            say "downloading $IMAGE_URL (~2 GB)"
+            curl -fL -C - -o "$gz" "$IMAGE_URL" || die "download failed"
+            verify_gz || die "sha256 mismatch"
         fi
         say "gunzip"
         gunzip -c "$gz" > "$IMAGE" & hp=$!
