@@ -325,10 +325,11 @@ cmd_keymap() {
             # launch path — an unanchored pattern makes pkill kill its own
             # ssh session (exit 255, keymapd never restarts)
             gexec 'sudo pkill -f "keymapd[.]py$" 2>/dev/null; sleep 0.5
-                   (sudo DISPLAY=:1 setsid nohup python3 ~/knulli-vm/keymapd.py >/tmp/keymap.log 2>&1 </dev/null &)
+                   mkdir -p ~/knulli-vm-logs
+                   (sudo DISPLAY=:1 setsid nohup python3 ~/knulli-vm/keymapd.py >~/knulli-vm-logs/keymap.log 2>&1 </dev/null &)
                    sleep 1.5
-                   pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd restarted" || { echo "FAILED to start keymapd:"; tail -5 /tmp/keymap.log; }';;
-        log) gexec 'tail -40 /tmp/keymap.log';;
+                   pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd restarted" || { echo "FAILED to start keymapd:"; tail -5 ~/knulli-vm-logs/keymap.log; }';;
+        log) gexec 'tail -40 ~/knulli-vm-logs/keymap.log 2>/dev/null || tail -40 /tmp/keymap.log';;
         status) gexec 'pgrep -f "keymapd[.]py" >/dev/null && echo "keymapd up (VNC keyboard maps to the pad)" || echo "keymapd DOWN — run: knulli-vm keymap restart"';;
         *) die "keymap: restart|log|status";;
     esac

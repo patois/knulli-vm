@@ -276,8 +276,8 @@ bin/                    built host binaries (gitignored)
   receives (if the log scrolls while you type but the app doesn't react,
   the problem is the joypad/app side, not the keyboard). Still nothing?
   No window manager exists, so `focusd.sh` (started by the launcher) keeps
-  focus on the app window; check `pgrep -f focusd` and `/tmp/focusd.log`
-  in the guest. (keymapd is now self-healing — it never blocks its X event
+  focus on the app window; check `pgrep -f focusd` and
+  `~/knulli-vm-logs/focusd.log` in the guest. (keymapd is now self-healing — it never blocks its X event
   thread on the joypad FIFO and reconnects if the X connection dies — but
   an old-style deaf instance from before that fix needs one restart.)
 - **VNC shows an auth error before the password prompt** — modern macOS

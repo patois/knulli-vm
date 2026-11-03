@@ -7,6 +7,13 @@
 set -u
 DIR="$1"; CMD="$2"; VNC_PASS="${3:-knulli}"
 G="$HOME/knulli-vm"
+# All our logs live under $HOME, never /tmp: root-era units left root-owned
+# /tmp/*.log behind, and the sticky bit then blocks a guest-user `> log`
+# redirect — silently killing every daemon spawned on that line (observed:
+# joypad and Xvnc both died at "Permission denied", so the app reported
+# "TrimUI Brick controller not found" and nothing listened on 5901).
+LOGD="$HOME/knulli-vm-logs"
+mkdir -p "$LOGD"
 PIDF=/tmp/knulli-app.pid
 # the app registry stores host paths; the chroot sees them without the prefix
 if [ -n "${KNULLI_ROOT:-}" ]; then
@@ -20,7 +27,7 @@ if [ -n "${KNULLI_ROOT:-}" ] && [ -x "$G/setup_audio.sh" ]; then
 fi
 
 pgrep -f "virtual_joypad[.]py" >/dev/null 2>&1 || {
-    sudo nohup python3 "$G/virtual_joypad.py" retrogame_joypad > /tmp/joypad.log 2>&1 &
+    sudo nohup python3 "$G/virtual_joypad.py" retrogame_joypad > "$LOGD/joypad.log" 2>&1 &
     sleep 1
 }
 # NO apt on this path, ever: a package install here (dpkg lock held by a
@@ -42,7 +49,12 @@ pgrep -f "virtual_joypad[.]py" >/dev/null 2>&1 || {
 # UI clipped away, "VNC cuts parts of the screen off"). The mark hashes the
 # password AND the Xvnc config version, so changing launch options below
 # forces a restart of a running-but-stale Xvnc.
-MARK=/tmp/knulli-vnc.passwd-md5
+MARK="$LOGD/vnc.passwd-md5"
+# a root-era Xvnc left /tmp/.X11-unix root-owned 0755: a guest Xvnc then
+# cannot create its socket and dies on "Cannot establish any listening
+# sockets". Ensure the conventional mode (idempotent).
+sudo mkdir -p /tmp/.X11-unix 2>/dev/null
+sudo chmod 1777 /tmp/.X11-unix 2>/dev/null
 want=$(printf '%s|v4-nosetsize' "$VNC_PASS" | md5sum | cut -d' ' -f1)
 if command -v Xvnc >/dev/null 2>&1; then
     if pgrep -x Xvnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
@@ -64,13 +76,13 @@ if command -v Xvnc >/dev/null 2>&1; then
         (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport 5901 \
             -SecurityTypes VncAuth -PasswordFile /tmp/knulli-vnc.pass \
             -AlwaysShared -localhost yes -AcceptSetDesktopSize=0 \
-            > /tmp/xvnc.log 2>&1 &)
+            > "$LOGD/xvnc.log" 2>&1 &)
         sleep 2
         [ "$(pgrep -cx Xvnc)" = 1 ] && echo "$want" > "$MARK"
     fi
 else
     # fallback: Xvfb + x11vnc (laggy input, see comment above)
-    pgrep -x Xvfb >/dev/null 2>&1 || (Xvfb :1 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & sleep 1)
+    pgrep -x Xvfb >/dev/null 2>&1 || (Xvfb :1 -screen 0 1280x720x24 >"$LOGD/xvfb.log" 2>&1 & sleep 1)
     if pgrep -x x11vnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
         x_ok=1
     else
@@ -79,7 +91,7 @@ else
     if [ "$x_ok" = 0 ]; then
         sudo pkill -x x11vnc 2>/dev/null; sleep 1
         x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
-            -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1
+            -rfbport 5901 -bg -o "$LOGD/x11vnc.log" >/dev/null 2>&1; sleep 1
         echo "$want" > "$MARK"
     fi
 fi
@@ -88,7 +100,7 @@ fi
 # deps only cost keyboard/focus convenience, never the app or VNC.
 pgrep -f "focusd[.]sh" >/dev/null 2>&1 || {
     if command -v xdotool >/dev/null 2>&1; then
-        nohup "$G/focusd.sh" > /tmp/focusd.log 2>&1 &
+        nohup "$G/focusd.sh" > "$LOGD/focusd.log" 2>&1 &
         sleep 1
     else
         echo "WARN: xdotool missing — window-focus helper off (re-run install.sh to fix)" >&2
@@ -97,7 +109,7 @@ pgrep -f "focusd[.]sh" >/dev/null 2>&1 || {
 # keyboard -> joypad on the VM display (needs python3-xlib)
 pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
     if python3 -c "import Xlib" 2>/dev/null; then
-        sudo DISPLAY=:1 nohup python3 "$G/keymapd.py" > /tmp/keymap.log 2>&1 &
+        sudo DISPLAY=:1 nohup python3 "$G/keymapd.py" > "$LOGD/keymap.log" 2>&1 &
         sleep 1
     else
         echo "WARN: python3-xlib missing — VNC keyboard mapping off (re-run install.sh to fix)" >&2
