@@ -23,17 +23,11 @@ pgrep -f "virtual_joypad[.]py" >/dev/null 2>&1 || {
     sudo nohup python3 "$G/virtual_joypad.py" retrogame_joypad > /tmp/joypad.log 2>&1 &
     sleep 1
 }
-command -v xdotool >/dev/null 2>&1 || sudo apt-get install -y -qq xdotool >/dev/null 2>&1
-pgrep -f "focusd[.]sh" >/dev/null 2>&1 || {
-    nohup "$G/focusd.sh" > /tmp/focusd.log 2>&1 &
-    sleep 1
-}
-# keyboard -> joypad on the VM display (needs python3-xlib)
-pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
-    python3 -c "import Xlib" 2>/dev/null || sudo apt-get install -y -qq python3-xlib >/dev/null 2>&1
-    sudo DISPLAY=:1 nohup python3 "$G/keymapd.py" > /tmp/keymap.log 2>&1 &
-    sleep 1
-}
+# NO apt on this path, ever: a package install here (dpkg lock held by a
+# fresh VM's boot-time apt activity, or a network stall) can block for
+# minutes silently, and the display/app sit behind it. All display/input
+# packages are ensured by install.sh / the lima template instead; the
+# optional input helpers below degrade to a WARN when a dep is missing.
 # Display + VNC: prefer TigerVNC's Xvnc (X server and VNC server in one,
 # modern input pipeline) over Xvfb+x11vnc. x11vnc starves its client input
 # queue while diffing the framebuffer (Recv-Q grew unboundedly under
@@ -85,6 +79,26 @@ else
         echo "$want" > "$MARK"
     fi
 fi
+
+# Optional input helpers, AFTER the display is up (they need :1). Missing
+# deps only cost keyboard/focus convenience, never the app or VNC.
+pgrep -f "focusd[.]sh" >/dev/null 2>&1 || {
+    if command -v xdotool >/dev/null 2>&1; then
+        nohup "$G/focusd.sh" > /tmp/focusd.log 2>&1 &
+        sleep 1
+    else
+        echo "WARN: xdotool missing — window-focus helper off (re-run install.sh to fix)" >&2
+    fi
+}
+# keyboard -> joypad on the VM display (needs python3-xlib)
+pgrep -f "keymapd[.]py" >/dev/null 2>&1 || {
+    if python3 -c "import Xlib" 2>/dev/null; then
+        sudo DISPLAY=:1 nohup python3 "$G/keymapd.py" > /tmp/keymap.log 2>&1 &
+        sleep 1
+    else
+        echo "WARN: python3-xlib missing — VNC keyboard mapping off (re-run install.sh to fix)" >&2
+    fi
+}
 
 # Stop a previously launched app — the WHOLE tree. A wrapper-only kill
 # orphans the app UI + audio pump + aplay at ppid=1, where they keep an

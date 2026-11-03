@@ -21,6 +21,7 @@ provision:
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       squashfs-tools \
       alsa-utils \
+      tigervnc-standalone-server tigervnc-common tigervnc-tools \
       xvfb x11vnc xauth \
       imagemagick \
       xdotool \

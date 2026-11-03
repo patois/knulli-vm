@@ -183,16 +183,23 @@ cmd_start() {
     gexec "test -f ~/knulli-vm/run_app.sh" \
         || die "guest launcher missing (~/knulli-vm/run_app.sh) — run: knulli-vm sync"
     echo "starting '$app' in the KNULLI userspace ($VM) ..."
-    # Fully detached launch: subshell + setsid + stdin off the tty, and
-    # stale pid/log cleared FIRST so what we read below is from THIS run.
-    # The old `nohup ... &` form was observed (fresh install, other
-    # machine) to die with limactl's ssh session WITHOUT even creating
-    # the app log — the same teardown cmd_keymap and run_app.sh's Xvnc
-    # launch already dodge with this exact pattern; this was the last
-    # plain-& launch left. (An env prefix cannot sit before `( )` — not
-    # valid bash — hence the assignment inside the subshell.)
+    # Fully detached launch; stale pid/log cleared FIRST so what we read
+    # below is from THIS run. On a second machine even `setsid nohup ... &`
+    # was observed to die with limactl's ssh session without ever creating
+    # the app log. A systemd *transient unit* is spawned by PID 1, so it
+    # is outside the ssh session's reach entirely. Unique unit name so a
+    # relaunch never collides with the previous exited unit; --collect
+    # garbage-collects it when the app stops. HOME must be passed
+    # explicitly: system units get no user environment.
+    local unit="knulli-app-$(date +%s)"
     gexec "rm -f /tmp/knulli-app.pid ~/knulli-app.log
-           (KNULLI_ROOT='$ROOTFS' setsid nohup ~/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' </dev/null > ~/knulli-app.log 2>&1 &)" \
+           if command -v systemd-run >/dev/null; then
+               sudo systemd-run --quiet --collect --unit='$unit' \\
+                   --setenv=KNULLI_ROOT='$ROOTFS' --setenv=HOME=\$HOME \\
+                   /bin/bash -c \"\$HOME/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > \$HOME/knulli-app.log 2>&1\"
+           else
+               (KNULLI_ROOT='$ROOTFS' setsid nohup \$HOME/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' </dev/null > \$HOME/knulli-app.log 2>&1 &)
+           fi" \
         || die "could not reach the guest to launch the app"
     # run_app.sh apt-installs xdotool/python3-xlib on a FIRST run (a
     # minute on a fresh VM) before it writes the pid file — the old
@@ -259,7 +266,10 @@ cmd_status() {
         printf "  display: "; { pgrep -x Xvnc >/dev/null || pgrep -x Xvfb >/dev/null; } && echo ":1 up" || echo down
         printf "  vnc:     "; if pgrep -x Xvnc >/dev/null; then echo "Xvnc :5901 up"; elif pgrep -x x11vnc >/dev/null; then echo "x11vnc :5901 up"; else echo down; fi
         printf "  keymap:  "; pgrep -f "keymapd[.]py" >/dev/null && echo "keyboard->pad up" || echo "DOWN (knulli-vm keymap restart)"
-        printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "running (pid $p)" || echo not running'
+        # ps -p, NOT kill -0: the tracked pid setuids to root via sudo inside
+    # the chroot, and kill -0 from the guest user gives EPERM on a live
+    # root process — status then cries "not running" while the app plays.
+    printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && ps -p "$p" -o pid= >/dev/null 2>&1 && echo "running (pid $p)" || echo not running'
     printf "  audio:   "; audio_running >/dev/null && echo "streaming to Mac (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming"
     echo "  apps:"; (cmd_app list) | sed 's/^/    /'
 }

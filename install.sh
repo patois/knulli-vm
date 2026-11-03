@@ -78,6 +78,16 @@ if ! limactl list --json 2>/dev/null | grep -q "\"name\":\"$VM\".*\"status\":\"R
     limactl list | grep -q "^$VM[[:space:]].*Running" || \
         die "VM failed to start (note: lima can stall on its optional containerd step; try 'limactl shell $VM' manually)"
 fi
+# "Running" only means the hypervisor process is alive — cloud-init can
+# still be holding ssh at "Connection refused" for tens of seconds after,
+# and every deploy call then fails confusingly (observed: fresh VM,
+# "failed to deploy ... Connection refused"). Wait for ssh to answer.
+sv=0
+until limactl shell "$VM" -- true 2>/dev/null; do
+    sleep 5; sv=$((sv + 5))
+    [ $((sv % 30)) -eq 0 ] && say "waiting for guest ssh ... ${sv}s"
+    [ "$sv" -ge 180 ] && die "guest ssh never answered on '$VM' (inspect: limactl shell $VM)"
+done
 say "VM '$VM' is up"
 
 # ---- 2. deploy guest scripts ---------------------------------------------------
@@ -94,6 +104,29 @@ for f in "$HERE"/lib/guest/*; do
         || die "failed to deploy lib/guest/$(basename "$f") to the guest"
 done
 say "guest scripts deployed to ~/knulli-vm"
+
+# ---- 2b. guest packages --------------------------------------------------------
+# The lima template provisions these, but templates only apply at VM CREATION
+# — VMs built from an older template (and thus every install made before
+# tigervnc was added to it) must be able to heal by re-running this script.
+# run_app.sh deliberately never runs apt itself, so this is the one place
+# display/input deps get ensured. Only touches what's actually missing.
+say "ensuring guest display/input packages"
+limactl shell "$VM" -- bash -lc '
+    need=()
+    command -v Xvnc       >/dev/null 2>&1 || need+=(tigervnc-standalone-server tigervnc-common tigervnc-tools)
+    command -v xdotool    >/dev/null 2>&1 || need+=(xdotool)
+    command -v Xvfb       >/dev/null 2>&1 || need+=(xvfb x11vnc)
+    command -v import     >/dev/null 2>&1 || need+=(imagemagick)
+    python3 -c "import Xlib" >/dev/null 2>&1 || need+=(python3-xlib)
+    if [ ${#need[@]} -eq 0 ]; then echo "all present"; exit 0; fi
+    echo "installing: ${need[*]}"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        -o DPkg::Lock::Timeout=120 "${need[@]}"
+' </dev/null & hp=$!
+heartbeat "apt in guest" $hp
+wait $hp || say "WARNING: guest package install failed — VNC may fall back or keyboard mapping be off"
 
 # ---- 3. obtain the knulli image ------------------------------------------------
 ROOTFS=$(gexec 'echo $HOME/knulli-root')
