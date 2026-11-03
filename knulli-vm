@@ -180,14 +180,44 @@ cmd_start() {
     # capture side first: if the app opens its ALSA stream before arecord
     # exists it underruns repeatedly and can end up ignoring input
     (cmd_audio start) || echo "  (audio could not start — retry: knulli-vm audio start)"
+    gexec "test -f ~/knulli-vm/run_app.sh" \
+        || die "guest launcher missing (~/knulli-vm/run_app.sh) — run: knulli-vm sync"
     echo "starting '$app' in the KNULLI userspace ($VM) ..."
-    gexec "KNULLI_ROOT='$ROOTFS' nohup ~/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > ~/knulli-app.log 2>&1 &"
-    sleep 8
-    local pid; pid=$(gexec "cat /tmp/knulli-app.pid 2>/dev/null")
-    if [ -n "$pid" ] && gexec "kill -0 '$pid'" 2>/dev/null; then
+    # Fully detached launch: subshell + setsid + stdin off the tty, and
+    # stale pid/log cleared FIRST so what we read below is from THIS run.
+    # The old `nohup ... &` form was observed (fresh install, other
+    # machine) to die with limactl's ssh session WITHOUT even creating
+    # the app log — the same teardown cmd_keymap and run_app.sh's Xvnc
+    # launch already dodge with this exact pattern; this was the last
+    # plain-& launch left. (An env prefix cannot sit before `( )` — not
+    # valid bash — hence the assignment inside the subshell.)
+    gexec "rm -f /tmp/knulli-app.pid ~/knulli-app.log
+           (KNULLI_ROOT='$ROOTFS' setsid nohup ~/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' </dev/null > ~/knulli-app.log 2>&1 &)" \
+        || die "could not reach the guest to launch the app"
+    # run_app.sh apt-installs xdotool/python3-xlib on a FIRST run (a
+    # minute on a fresh VM) before it writes the pid file — the old
+    # fixed `sleep 8` declared failure while it was still installing.
+    # Poll instead; ps -p (not kill -0) so a later setuid-to-root of the
+    # tracked pid doesn't read as "dead" via EPERM.
+    local pid="" t=0
+    while [ "$t" -lt 180 ]; do
+        pid=$(gexec "cat /tmp/knulli-app.pid 2>/dev/null")
+        if [ -n "$pid" ]; then
+            gexec "ps -p '$pid' -o pid=" >/dev/null 2>&1 || break  # died after writing it; log holds the reason
+            break
+        fi
+        sleep 3; t=$((t + 3))
+        [ $((t % 15)) -eq 0 ] && echo "  waiting for the app ... ${t}s"
+    done
+    if [ -n "$pid" ] && gexec "ps -p '$pid' -o pid=" >/dev/null 2>&1; then
         echo "OK — $app running (guest pid $pid)"
     else
-        echo "failed; app log:"; gexec "tail -20 ~/knulli-app.log"; exit 1
+        echo "failed; app log:"
+        gexec "tail -20 ~/knulli-app.log 2>/dev/null || {
+            echo '(no app log at all: the launcher never ran)';
+            ls -l ~/knulli-vm/run_app.sh 2>&1;
+            echo 'try: knulli-vm sync, then knulli-vm start'; }"
+        exit 1
     fi
     echo "  VNC:  open vnc://localhost:5901   (password: ${VNC_PASS:-knulli})"
     echo "  input: knulli-vm input 'hat down 150'   |   knulli-vm bridge (physical pad)"
