@@ -65,8 +65,19 @@ SDL build) detect existing state and skip.
 open vnc://localhost:5901      # macOS Screen Sharing; password 'knulli'
 ./knulli-vm status             # VM / services / app / apps
 ./knulli-vm screenshot         # grab the display to a PNG
-./knulli-vm stop
+./knulli-vm stop               # stop the app (VM keeps running)
+./knulli-vm down               # shut the VM down too (stops app + audio first)
+./knulli-vm down --force       # ...hard kill, for a wedged guest that ignores
+                               #    graceful shutdown
+./knulli-vm up                 # bring a stopped VM back (waits for ssh, not
+                               #    just the hypervisor, before reporting up)
 ```
+
+`stop` vs `down`: `stop` kills the app tree and audio pipe inside the VM;
+`down` does that first, then shuts the VM itself off (frees its RAM/CPU;
+everything on disk is kept). Re-run `./install.sh` any time to heal a VM
+after updates — it re-deploys guest scripts and re-verifies the SDL2 x11
+closure.
 
 **Apps** (install time or later; zip, directory, or URL):
 

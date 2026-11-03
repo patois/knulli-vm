@@ -60,23 +60,38 @@ command -v python3 >/dev/null || die "python3 not found (xcode-select --install)
 gexec() { limactl shell "$VM" -- bash -lc "$1"; }
 
 # ---- 1. create/start the VM ----------------------------------------------------
+# limactl's output goes to a BOOTLOG, never /dev/null: a first run spends
+# minutes downloading the Ubuntu image, and when it FAILED the old version
+# hid why and just polled to its 450 s deadline, killing its own still-
+# progressing limactl at the buzzer — which read as "stuck in a loop
+# failing to boot". Now: fail the moment limactl dies (with its tail),
+# poll patiently while it lives, and never kill a healthy start.
+mkdir -p "$STATE"
+BOOTLOG="$STATE/$VM.boot.log"
 if ! limactl list --json 2>/dev/null | grep -q "\"name\":\"$VM\".*\"status\":\"Running\""; then
     if ! limactl list 2>/dev/null | grep -q "^$VM[[:space:]]"; then
         say "creating VM '$VM' (Ubuntu 24.04 arm64, vz; first run downloads the OS image)"
+        # template form only for NEW instances — limactl rejects a template
+        # for an instance that already exists (it errored out instantly on a
+        # stopped VM while the poll loop waited for a boot that never came)
+        limactl start "$HERE/vm/knulli.yaml" --name "$VM" >"$BOOTLOG" 2>&1 &
     else
         say "starting VM '$VM'"
+        limactl start "$VM" >"$BOOTLOG" 2>&1 &
     fi
-    limactl start "$HERE/vm/knulli.yaml" --name "$VM" >/dev/null 2>&1 &
     SP=$!
     tv=0
-    for _ in $(seq 1 90); do
+    while :; do
         limactl list --json 2>/dev/null | grep -q "\"name\":\"$VM\".*\"status\":\"Running\"" && break
+        if ! kill -0 "$SP" 2>/dev/null; then
+            tail -5 "$BOOTLOG" >&2
+            die "VM '$VM' failed to start (full limactl output: $BOOTLOG)"
+        fi
         sleep 5; tv=$((tv + 5))
-        [ $((tv % 30)) -eq 0 ] && say "waiting for VM to boot ... ${tv}s"
+        [ $((tv % 30)) -eq 0 ] && say "waiting for VM to boot ... ${tv}s (limactl: tail -f $BOOTLOG)"
+        [ "$tv" -ge 1800 ] && { tail -5 "$BOOTLOG" >&2; die "VM '$VM' not Running after 30 min — check $BOOTLOG"; }
     done
-    kill "$SP" 2>/dev/null
-    limactl list | grep -q "^$VM[[:space:]].*Running" || \
-        die "VM failed to start (note: lima can stall on its optional containerd step; try 'limactl shell $VM' manually)"
+    wait "$SP" 2>/dev/null || true
 fi
 # "Running" only means the hypervisor process is alive — cloud-init can
 # still be holding ssh at "Connection refused" for tens of seconds after,

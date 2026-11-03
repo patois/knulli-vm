@@ -424,10 +424,50 @@ cmd_sync() {
     echo "guest scripts synced"
 }
 
+cmd_up() {
+    if limactl list | grep -q "^$VM[[:space:]].*Running"; then
+        echo "VM '$VM' already running"; return 0
+    fi
+    echo "starting VM '$VM' ..."
+    limactl start "$VM" >/dev/null 2>&1 || die "limactl start failed for '$VM'"
+    # "Running" only means the hypervisor is alive — cloud-init can still
+    # hold ssh at "Connection refused" for tens of seconds (same trap as
+    # install.sh step 1). Don't report up until a command lands.
+    local t=0
+    until limactl shell "$VM" -- true 2>/dev/null; do
+        sleep 2; t=$((t + 2))
+        [ "$t" -ge 120 ] && die "VM '$VM' booted but ssh never answered (limactl shell $VM)"
+    done
+    echo "VM '$VM' up"
+}
+
+cmd_down() {
+    local force="${1:-}"
+    case "$force" in
+        -f|--force)
+            # Hard stop: SIGKILL the hypervisor, no guest shutdown — the
+            # escape hatch when the guest is wedged and limactl stop hangs.
+            echo "force-stopping VM '$VM' (no guest shutdown) ..."
+            limactl stop -f "$VM" || die "limactl stop -f failed"
+            echo "VM '$VM' killed — start again: knulli-vm up"
+            return;;
+        "") ;;
+        *) die "down: --force for a hard stop";;
+    esac
+    # Best effort, never blocking: if the guest ssh is already dead the
+    # point is moot and limactl stop must still run.
+    cmd_stop >/dev/null 2>&1 || true
+    echo "stopping VM '$VM' (graceful) ..."
+    limactl stop "$VM" || die "limactl stop failed — try: knulli-vm down --force"
+    echo "VM '$VM' stopped — start again: knulli-vm up"
+}
+
 # ---- dispatch ----------------------------------------------------------------
 case "${1:-help}" in
     start) shift; cmd_start "$@";;
     stop) cmd_stop;;
+    up) cmd_up;;
+    down) shift; cmd_down "${1:-}";;
     status) cmd_status;;
     vnc) cmd_vnc;;
     keymap) shift; cmd_keymap "${1:-status}";;
@@ -441,8 +481,11 @@ case "${1:-help}" in
         cat <<'EOF'
 knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
 
+  knulli-vm up                   start the VM itself (knulli-vm start assumes it runs)
   knulli-vm start [app]         start services + app (default app if omitted)
   knulli-vm stop                stop the app
+  knulli-vm down [--force]      shut the VM down (stops app+audio first;
+                                --force = hard kill, for a wedged guest)
   knulli-vm status              VM / services / app / installed apps
   knulli-vm vnc                 VNC URL + password
   knulli-vm screenshot [file]   grab the VM display
