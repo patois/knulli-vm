@@ -52,9 +52,13 @@ if command -v Xvnc >/dev/null 2>&1; then
         # "Cannot establish any listening sockets" while the marker got
         # written anyway — leaving the STALE server (old geometry/flags)
         # masquerading as configured on every later start.
-        pkill -x x11vnc 2>/dev/null; pkill -x Xvfb 2>/dev/null
-        pkill -x Xvnc 2>/dev/null; sleep 1
-        rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
+        # sudo: a previous server may be root-owned (root-era units);
+        # a guest-user pkill silently leaves it holding :5901 and the
+        # replacement dies on "Cannot establish any listening sockets"
+        sudo pkill -x x11vnc 2>/dev/null; sudo pkill -x Xvfb 2>/dev/null
+        sudo pkill -x Xvnc 2>/dev/null; sleep 1
+        sudo rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
+        sudo rm -f /tmp/knulli-vnc.pass 2>/dev/null
         printf '%s\n%s\n' "$VNC_PASS" "$VNC_PASS" | vncpasswd -f > /tmp/knulli-vnc.pass
         chmod 600 /tmp/knulli-vnc.pass
         (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport 5901 \
@@ -73,7 +77,7 @@ else
         x_ok=0
     fi
     if [ "$x_ok" = 0 ]; then
-        pkill -x x11vnc 2>/dev/null; sleep 1
+        sudo pkill -x x11vnc 2>/dev/null; sleep 1
         x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
             -rfbport 5901 -bg -o /tmp/x11vnc.log >/dev/null 2>&1; sleep 1
         echo "$want" > "$MARK"

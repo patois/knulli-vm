@@ -192,9 +192,23 @@ cmd_start() {
     # garbage-collects it when the app stops. HOME must be passed
     # explicitly: system units get no user environment.
     local unit="knulli-app-$(date +%s)"
-    gexec "rm -f /tmp/knulli-app.pid ~/knulli-app.log
+    gexec "rm -f /tmp/knulli-app.pid ~/knulli-app.log \\
+               || sudo rm -f /tmp/knulli-app.pid ~/knulli-app.log
            if command -v systemd-run >/dev/null; then
+               # KillMode=process: the default (control-group) would kill
+               # Xvnc/joypad/keymapd too — run_app.sh spawns them inside
+               # this unit's cgroup, so an app crash would take the VNC
+               # server down with it (observed: Xvnc exit report right
+               # after startup, nothing left listening on 5901).
+               # User=<guest user>: sudo systemd-run would run the unit as
+               # ROOT, flipping the whole launcher's privilege model —
+               # /tmp/knulli-app.pid becomes root-owned and later
+               # start/stop (guest rm -f, sticky /tmp) can no longer clear
+               # it, and a root Xvnc locks the guest user out of DISPLAY
+               # :1 (screenshots die). run_app.sh sudo's internally where
+               # it needs to; the unit itself must run as the lima user.
                sudo systemd-run --quiet --collect --unit='$unit' \\
+                   --property=KillMode=process --property=User=\$(id -un) \\
                    --setenv=KNULLI_ROOT='$ROOTFS' --setenv=HOME=\$HOME \\
                    /bin/bash -c \"\$HOME/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > \$HOME/knulli-app.log 2>&1\"
            else
@@ -226,7 +240,7 @@ cmd_start() {
             echo 'try: knulli-vm sync, then knulli-vm start'; }"
         exit 1
     fi
-    echo "  VNC:  open vnc://localhost:5901   (password: ${VNC_PASS:-knulli})"
+    cmd_vnc | sed 's/^/  /'
     echo "  input: knulli-vm input 'hat down 150'   |   knulli-vm bridge (physical pad)"
     echo "         keyboard on the VNC screen: WASD/arrows=dpad j=A k=B u/x=X i=Y"
     echo "         q/e=L1/R1 z/c=L2/R2 Enter=Start Bksp=Select F1/F2=tabs"
@@ -245,7 +259,7 @@ cmd_stop() {
     # SIGTERM is NOT enough: the app installs signal handlers and survives
     # it (observed — orphaned UI kept serving a respawned aplay), so every
     # kill here is TERM, grace, then -9.
-    gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); rm -f /tmp/knulli-app.pid
+    gexec 'p=$(cat /tmp/knulli-app.pid 2>/dev/null); rm -f /tmp/knulli-app.pid || sudo rm -f /tmp/knulli-app.pid
         killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; sudo kill "$1" 2>/dev/null; }
         [ -n "$p" ] && killtree "$p"
         sleep 1
@@ -274,7 +288,30 @@ cmd_status() {
     echo "  apps:"; (cmd_app list) | sed 's/^/    /'
 }
 
-cmd_vnc() { echo "vnc://localhost:5901  (password: ${VNC_PASS:-knulli})"; }
+# Xvnc binds the GUEST loopback (-localhost yes). Lima >= 2.1 (vz)
+# auto-forwards guest listeners to host localhost — older Lima does not,
+# and "VNC won't connect" then has nothing to do with the app. If the
+# guest is listening but the host is not, open an ssh tunnel ourselves.
+VNC_TUNNEL_PIDF="$STATE/vnc.$VM.pid"
+
+cmd_vnc() {
+    if gexec 'ss -ltn | grep -q ":5901 "' 2>/dev/null; then
+        if ! nc -z 127.0.0.1 5901 2>/dev/null; then
+            local tp; tp=$(cat "$VNC_TUNNEL_PIDF" 2>/dev/null)
+            if [ -z "$tp" ] || ! kill -0 "$tp" 2>/dev/null; then
+                echo "lima does not forward guest :5901 — starting ssh tunnel ..."
+                nohup ssh -F "$HOME/.lima/$VM/ssh.config" "lima-$VM" \
+                    -nNT -o ExitOnForwardFailure=yes -L 5901:localhost:5901 \
+                    >/dev/null 2>&1 &
+                echo $! > "$VNC_TUNNEL_PIDF"
+                sleep 1
+            fi
+        fi
+    else
+        echo "note: nothing is listening on guest :5901 — start the app first (knulli-vm start)"
+    fi
+    echo "vnc://localhost:5901  (password: ${VNC_PASS:-knulli})"
+}
 
 # The VNC keyboard -> pad mapper (keymapd.py). If keys stop mapping on the
 # VNC screen, restart it here and read its per-key log.
