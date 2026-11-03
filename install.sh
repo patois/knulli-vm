@@ -196,14 +196,20 @@ limactl shell "$VM" -- bash -lc "~/knulli-vm/setup_audio.sh '$ROOTFS'" \
     || say "WARNING: audio setup failed (the app will be silent)"
 
 # ---- 6. config ------------------------------------------------------------------
+# Write via a temp only if the whole block SUCCEEDS. The old trailing
+# `[ -f "$CONF" ] && grep ...` made the block exit 1 on every FRESH install
+# (no conf to preserve yet), so `&& mv` was skipped: conf.tmp left behind,
+# no conf, yet state/default was written on the next line and the installer
+# still said "ready" — every knulli-vm command then died "no config".
+# grep-no-match-or-absent must be `|| true`, never a tested `[ -f ]`.
 CONF="$STATE/$VM.conf"
 {
     echo "VM_NAME=$VM"
     echo "ROOTFS=$ROOTFS"
     echo "VNC_PASS=$VNC_PASS"
     echo "IMAGE=$IMAGE"
-    [ -f "$CONF" ] && grep '^DEFAULT_APP=' "$CONF"
-} > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    grep '^DEFAULT_APP=' "$CONF" 2>/dev/null || true
+} > "$CONF.tmp" && mv "$CONF.tmp" "$CONF" || die "could not write $CONF"
 echo "$VM" > "$STATE/default"
 say "config: $CONF"
 

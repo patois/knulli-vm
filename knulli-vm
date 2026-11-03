@@ -15,7 +15,7 @@ if [ -z "$VM" ]; then
     VM=$(cat "$STATE/default")
 fi
 CONF="$STATE/$VM.conf"
-[ -f "$CONF" ] || die "no config for VM '$VM' ($CONF)"
+[ -f "$CONF" ] || die "no config for VM '$VM' ($CONF) — re-run ./install.sh to regenerate it"
 # shellcheck disable=SC2046
 eval "$(grep -E '^[A-Z_]+=' "$CONF" | sed 's/^/export /')"
 
