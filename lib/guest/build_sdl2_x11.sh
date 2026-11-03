@@ -13,9 +13,48 @@ R="$1"
 SDL_VER=2.32.10
 D="$R/opt/sdl2-x11"
 SUDO=sudo
+L=/usr/lib/aarch64-linux-gnu
 
-if $SUDO test -e "$D/libSDL2-2.0.so.0" && $SUDO test -e "$D/libX11.so.6"; then
-    echo "SDL2 x11-compat already present at $D — skipping"
+# SDL2 dlopen()s its X-side libraries at RUNTIME (libX11.so.6, ...), so they
+# never show up as ldd "not found" and NO ldd-based closure can be complete
+# for them — a fresh chroot (the image ships no X11) then dies at pygame's
+# "x11 not available". Copy the runtime set explicitly (the set a working
+# VM's closure holds) and gate on an actual dlopen through SDL's own path.
+# libX11's own deps (libxcb -> libbsd -> libmd, libXau/libXdmcp) must be in
+# here too: dlopen resolves those transitively and they are just as absent
+# from the chroot.
+XRUNTIME="libX11.so.6 libXau.so.6 libXcursor.so.1 libXdmcp.so.6 libXext.so.6
+libXfixes.so.3 libXi.so.6 libXrandr.so.2 libXrender.so.1 libXss.so.1
+libbsd.so.0 libdecor-0.so.0 libdrm.so.2 libgbm.so.1 libmd.so.0
+libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1
+libxcb.so.1 libxkbcommon.so.0"
+
+copy_x_runtime() {
+    for n in $XRUNTIME; do
+        # `if`, never `f=$(ls $L/$n | head -1)`-style probing: a failed
+        # command substitution in an assignment returns non-zero and
+        # `set -euo pipefail` kills the script mid-copy (observed: a host
+        # without libdecor aborted right after libbsd, libxcb never got
+        # copied, dlopen of libX11 still failed — and the old skip-check
+        # then blessed the half closure forever).
+        if [ -e "$L/$n" ]; then
+            $SUDO cp -f "$L/$n" "$D/$n"
+        fi
+    done
+    if ! $SUDO chroot "$R" env -i LD_LIBRARY_PATH=/opt/sdl2-x11 /usr/bin/python3 \
+            -c 'import ctypes; ctypes.CDLL("libX11.so.6")' 2>/dev/null; then
+        echo "SDL2 X runtime libs not dlopen-able inside the chroot" >&2
+        exit 1
+    fi
+}
+
+# "Already present" is decided by SDL's real load path (dlopen inside the
+# chroot), not by file existence: after repairing the copy loop, re-running
+# this script also heals half-built closures from the broken versions.
+if $SUDO test -e "$D/libSDL2-2.0.so.0"; then
+    echo "SDL2 x11-compat present — verifying X runtime closure"
+    copy_x_runtime
+    echo "SDL $SDL_VER (x11) verified at $D"
     exit 0
 fi
 
@@ -52,43 +91,26 @@ if ! strings "$D/libSDL2-2.0.so.0" | grep "libX11.so.6" >/dev/null; then
     exit 1
 fi
 
-# Copy the X-side dependency closure, iterating until ldd (run with the
-# chroot's own loader) resolves everything. glibc core and libasound are
-# excluded: the chroot's newer glibc must stay authoritative, and SDL should
-# use knulli's ALSA.
-EXCLUDE="ld-linux|/libc\.so|/libm\.so|/libdl\.so|/librt\.so|/libpthread\.so|/libutil\.so|libasound|libSDL2"
+# Direct NEEDED deps (if any) via ldd, iterating until the chroot's own
+# loader resolves everything. glibc core and libasound are excluded: the
+# chroot's newer glibc must stay authoritative, and SDL should use knulli's
+# own ALSA.
+EXCLUDE="ld-linux|libc\.so|libm\.so|libdl\.so|librt\.so|libpthread\.so|libutil\.so|libasound|libSDL2"
 for _ in 1 2 3 4 5 6; do
     MISS=$($SUDO chroot "$R" env LD_LIBRARY_PATH=/opt/sdl2-x11 \
         ldd /opt/sdl2-x11/libSDL2-2.0.so.0 2>/dev/null \
         | awk '/not found/{print $1}')
-    [ -z "$MISS" ] && break
+    if [ -z "$MISS" ]; then break; fi
     for n in $MISS; do
-        f=$(ls "/usr/lib/aarch64-linux-gnu/$n" 2>/dev/null | head -1)
-        [ -n "$f" ] && ! echo "$f" | grep -qE "$EXCLUDE" && $SUDO cp "$f" "$D/"
+        if [ -e "$L/$n" ] && ! echo "$n" | grep -qE "$EXCLUDE"; then
+            $SUDO cp "$L/$n" "$D/"
+        fi
     done
 done
 if $SUDO chroot "$R" env LD_LIBRARY_PATH=/opt/sdl2-x11 \
-        ldd /opt/sdl2-x11/libSDL2-2.0.so.0 2>/dev/null | grep -q "not found"; then
+        ldd /opt/sdl2-x11/libSDL2-2.0.so.0 2>/dev/null | grep "not found"; then
     echo "SDL2 dependency closure incomplete" >&2; exit 1
 fi
 
-# The ldd loop above CANNOT see the X runtime libs: SDL2 dlopen()s
-# libX11/libXext/... at runtime, so they never show as ldd "not found" —
-# a fresh chroot (the image ships no X11) got a "complete" closure of just
-# libSDL2 and pygame died at "x11 not available". Copy the runtime set
-# explicitly (the set a working VM's closure contains), then gate on an
-# actual dlopen through SDL's own load path, not on ldd.
-XRUNTIME="libX11.so.6 libXau.so.6 libXcursor.so.1 libXdmcp.so.6 libXext.so.6
-libXfixes.so.3 libXi.so.6 libXrandr.so.2 libXrender.so.1 libXss.so.1
-libbsd.so.0 libdecor-0.so.0 libdrm.so.2 libgbm.so.1 libmd.so.0
-libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1
-libxcb.so.1 libxkbcommon.so.0"
-for n in $XRUNTIME; do
-    f=$(ls "/usr/lib/aarch64-linux-gnu/$n" 2>/dev/null | head -1)
-    [ -n "$f" ] && $SUDO cp -f "$f" "$D/$n"
-done
-if ! $SUDO chroot "$R" env -i LD_LIBRARY_PATH=/opt/sdl2-x11 /usr/bin/python3 \
-        -c 'import ctypes; ctypes.CDLL("libX11.so.6")' 2>/dev/null; then
-    echo "SDL2 X runtime libs not dlopen-able inside the chroot" >&2; exit 1
-fi
+copy_x_runtime
 echo "SDL $SDL_VER (x11) installed at $D"
