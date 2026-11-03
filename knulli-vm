@@ -6,6 +6,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 STATE="$HERE/state"
 
 die() { echo "knulli-vm: $*" >&2; exit 1; }
+has_quote() { case "$1" in *"'"*) return 0;; *) return 1;; esac; }
+# enc — ship a path/command through an ssh command line without quoting
+# hazards. App dirs keep the vendor's name ("grainbrick beta 1.0.1") and
+# launch commands quote their own arguments; base64 is the only encoding
+# whose output cannot be re-split or re-quoted on the way to the guest.
+enc() { printf %s "$1" | base64 | tr -d '\n'; }
 
 # ---- selection & config -----------------------------------------------------
 VM=""
@@ -16,8 +22,14 @@ if [ -z "$VM" ]; then
 fi
 CONF="$STATE/$VM.conf"
 [ -f "$CONF" ] || die "no config for VM '$VM' ($CONF) — re-run ./install.sh to regenerate it"
-# shellcheck disable=SC2046
-eval "$(grep -E '^[A-Z_]+=' "$CONF" | sed 's/^/export /')"
+# Values may contain spaces — app dirs keep the vendor's own name, so
+# DEFAULT_APP can be "grainbrick beta 1.0.1" and IMAGE a path with spaces.
+# eval'ing `export K=V` split that into three words and died with
+# "export: `1.0.1': not a valid identifier", leaving DEFAULT_APP half-set.
+# Assign each pair as ONE argument instead.
+while IFS='=' read -r kn vv; do
+    [ -n "$kn" ] && export "$kn=$vv"
+done < <(grep -E '^[A-Z_]+=' "$CONF")
 
 gexec() { limactl shell "$VM" -- bash -lc "$1"; }
 appconf() { echo "$STATE/$VM.apps/$1"; }
@@ -65,9 +77,19 @@ cmd_app_add() {
 
     # unpack zips; find the app root. A single top-level directory wins even
     # when loose *.sh launcher companions sit next to it (GrainBrick's zip:
-    # "GrainBrick beta 1.0.sh" + grainbrick-beta/) — those .sh files are
-    # device-side launcher stubs, not the app.
-    local root
+    # "GrainBrick beta 1.0.1.sh" + "grainbrick beta 1.0.1/") — those .sh files
+    # are the launcher stubs KNULLI's EmulationStation runs on the device.
+    #
+    # Install the vendor's layout VERBATIM, name and all. Those stubs hardcode
+    # their own app dir (GrainBrick 1.0.1's is APP='/userdata/roms/ports/
+    # grainbrick beta 1.0.1') and the stub is what creates samples/, projects/
+    # and recordings/ and seeds them from demo-samples/ and demo-projects/ on
+    # first run. Renaming the directory to something shell-friendly — the old
+    # `tr ' ' '-'` — pointed the stub at a path that does not exist, so we
+    # skipped the stub and shipped users an empty sample browser the device
+    # would never show them. Keep the name; carry it safely instead (DIR/CMD
+    # reach the guest base64-encoded, so spaces cannot break the quoting).
+    local root stub=""
     if [ -d "$src" ]; then root="$src"
     elif unzip -l "$src" >/dev/null 2>&1; then
         local u="$HERE/downloads/unpacked/$(basename "${src%.zip}")"
@@ -75,18 +97,34 @@ cmd_app_add() {
         local n nsh
         n=$(find "$u" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
         nsh=$(find "$u" -mindepth 1 -maxdepth 1 -type f ! -name '*.sh' | wc -l | tr -d ' ')
-        if [ "$n" = 1 ] && [ "$nsh" = 0 ]; then root=$(find "$u" -mindepth 1 -maxdepth 1 -type d); else root="$u"; fi
+        if [ "$n" = 1 ] && [ "$nsh" = 0 ]; then
+            root=$(find "$u" -mindepth 1 -maxdepth 1 -type d)
+            # the sibling stub a device would install next to the app dir
+            stub=$(find "$u" -mindepth 1 -maxdepth 1 -type f -name '*.sh' | head -1)
+        else root="$u"; fi
     else die "unsupported app source (want .zip or directory): $src"; fi
 
-    [ -n "$name" ] || name=$(basename "$root" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')
+    [ -n "$name" ] || name=$(basename "$root")
     [ -n "$name" ] || die "could not derive an app name; pass --name"
+    # spaces are fine (everything is quoted or encoded); a single quote is not,
+    # because the chroot entry builds its command as a single-quoted string
+    has_quote "$name" && die "app name '$name' contains a single quote — pass --name"
+    has_quote "$stub" && die "launcher '$(basename "$stub")' has a single quote — pass --cmd"
 
+    # Launch the way the device does: the vendor's own stub when the zip
+    # shipped one, so its first-run setup runs. Only fall back to guessing an
+    # entry point inside the app dir (which skips that setup).
+    local cwd=""
+    if [ -z "$cmd" ] && [ -n "$stub" ]; then
+        cmd="sh './$(basename "$stub")'"; cwd="$ROOTFS/userdata/roms/ports"
+    fi
     if [ -z "$cmd" ]; then
         cmd=$(detect_cmd "$root") || die "cannot auto-detect a launch script in $root (tried gb_launch.py, main.py, run.sh, one *.sh) — pass --cmd"
     fi
 
     local gdest="\$HOME/knulli-ports/$name"   # staging dir inside the guest
     local rdest="$ROOTFS/userdata/roms/ports/$name"
+    local rports="$ROOTFS/userdata/roms/ports"
     echo "installing '$name' -> $rdest"
     # Upgrades preserve user data: apps like GrainBrick keep samples,
     # recordings, projects and settings INSIDE the app dir, and the app's
@@ -95,17 +133,18 @@ cmd_app_add() {
     # wins; new-version defaults fill the gaps).
     #
     # Copy notes: $gdest carries a literal $HOME for the GUEST to expand, so
-    # it must stay outside single quotes (app names are sanitized — never
-    # spaces). Always copy CONTENTS with the /. form: on Lima's virtiofs
-    # mount of the host home, `cp -a path/ dest/` (trailing slash) wrongly
-    # copies the directory ITSELF into dest — that produced maddening
-    # double-nested app dirs until diagnosed with a live probe. Also: no
-    # backticks in comments inside this string — double quotes turn them
-    # into command substitutions.
+    # it stays outside single quotes — which means it MUST be double-quoted
+    # here, since app dir names keep the vendor's spelling and can contain
+    # spaces ("grainbrick beta 1.0.1"). Always copy CONTENTS with the /. form:
+    # on Lima's virtiofs mount of the host home, `cp -a path/ dest/` (trailing
+    # slash) wrongly copies the directory ITSELF into dest — that produced
+    # maddening double-nested app dirs until diagnosed with a live probe.
+    # Also: no backticks in comments inside this string — double quotes turn
+    # them into command substitutions.
     gexec "
         set -e
-        sudo rm -rf $gdest && mkdir -p $gdest
-        cp -a '$root'/. $gdest/
+        sudo rm -rf \"$gdest\" && mkdir -p \"$gdest\"
+        cp -a '$root'/. \"$gdest/\"
         keep=()
         for p in samples recordings projects; do
             [ -d '$rdest/'\"\$p\" ] && keep+=(\"\$p\")
@@ -123,16 +162,38 @@ cmd_app_add() {
         fi
         sudo rm -rf '$rdest'
         sudo mkdir -p '$rdest'
-        sudo cp -a $gdest/. '$rdest/'
+        sudo cp -a \"$gdest/.\" '$rdest/'
         if [ -n \"\$stash\" ]; then
             sudo cp -a \"\$stash/.\" '$rdest/'
             sudo rm -rf \"\$stash\"
         fi
-        sudo rm -rf $gdest
+        sudo rm -rf \"$gdest\"
     " || die "copy into rootfs failed"
 
+    # the vendor's launcher stub goes NEXT TO the app dir, exactly where the
+    # app's own install instructions (and its hardcoded APP= path) expect it
+    local rstub=""
+    if [ -n "$stub" ]; then
+        rstub="$rports/$(basename "$stub")"
+        echo "installing launcher stub -> $rstub"
+        # staged through stdin (the deploy loop's proven pattern) — ssh joins
+        # extra argv with spaces and the remote shell re-splits them, so a
+        # path with spaces must never travel as an argument
+        limactl shell "$VM" -- bash -lc \
+            "mkdir -p \$HOME/knulli-ports; install -m 644 /dev/stdin \$HOME/knulli-ports/.stub-sh" \
+            < "$stub" || die "failed to stage the launcher stub"
+        gexec "set -e; sudo install -m 755 \$HOME/knulli-ports/.stub-sh '$rstub'; \\
+               rm -f \$HOME/knulli-ports/.stub-sh" \
+            || die "failed to install the launcher stub"
+    fi
+
     mkdir -p "$STATE/$VM.apps"
-    printf 'DIR=%s\nCMD=%s\n' "$rdest" "$cmd" > "$(appconf "$name")"
+    {
+        printf 'DIR=%s\nCMD=%s\n' "$rdest" "$cmd"
+        [ -n "$cwd" ]  && printf 'CWD=%s\n'  "$cwd"
+        [ -n "$rstub" ] && printf 'STUB=%s\n' "$rstub"
+        :
+    } > "$(appconf "$name")"
     if [ "$make_default" = 1 ] || [ -z "$(default_app)" ]; then
         grep -v '^DEFAULT_APP=' "$CONF" > "$CONF.tmp" || true
         echo "DEFAULT_APP=$name" >> "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
@@ -143,9 +204,12 @@ cmd_app_add() {
 cmd_app_rm() {
     local name="${1:-}"; [ -n "$name" ] || die "app rm: need a name"
     [ -f "$(appconf "$name")" ] || die "no app '$name'"
-    local rdest; rdest=$(grep '^DIR=' "$(appconf "$name")" | cut -d= -f2-)
-    gexec "sudo rm -rf '$rdest'"
-    rm -f "$(appconf "$name")"
+    local conf="$(appconf "$name")"
+    local rdest stub
+    rdest=$(grep '^DIR=' "$conf" | cut -d= -f2-)
+    stub=$(grep '^STUB=' "$conf" | cut -d= -f2-)
+    gexec "sudo rm -rf '$rdest'${stub:+; sudo rm -f '$stub'}"
+    rm -f "$conf"
     echo "removed $name"
 }
 
@@ -174,9 +238,14 @@ cmd_start() {
     local app="${1:-}"; app=${app:-$(default_app)}
     { [ -n "$app" ] && [ -f "$(appconf "$app")" ]; } || {
         cmd_app list; die "no app to start — install one: knulli-vm app add <zip|dir|url>"; }
-    local dir cmd
-    dir=$(grep '^DIR=' "$(appconf "$app")" | cut -d= -f2-)
-    cmd=$(grep '^CMD=' "$(appconf "$app")" | cut -d= -f2-)
+    local conf dir cmd cwd
+    conf="$(appconf "$app")"
+    dir=$(grep '^DIR=' "$conf" | cut -d= -f2-)
+    cmd=$(grep '^CMD=' "$conf" | cut -d= -f2-)
+    # CWD is the dir the launcher runs from — the ports/ directory when the
+    # app ships a launcher stub (that is where EmulationStation runs it),
+    # otherwise the app dir itself
+    cwd=$(grep '^CWD=' "$conf" | cut -d= -f2-); cwd="${cwd:-$dir}"
     # capture side first: if the app opens its ALSA stream before arecord
     # exists it underruns repeatedly and can end up ignoring input
     (cmd_audio start) || echo "  (audio could not start — retry: knulli-vm audio start)"
@@ -210,9 +279,9 @@ cmd_start() {
                sudo systemd-run --quiet --collect --unit='$unit' \\
                    --property=KillMode=process --property=User=\$(id -un) \\
                    --setenv=KNULLI_ROOT='$ROOTFS' --setenv=HOME=\$HOME \\
-                   /bin/bash -c \"\$HOME/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' > \$HOME/knulli-app.log 2>&1\"
+                   /bin/bash -c \"\$HOME/knulli-vm/run_app.sh b64:$(enc "$cwd") b64:$(enc "$cmd") '${VNC_PASS:-knulli}' '${VNC_PORT:-5901}' > \$HOME/knulli-app.log 2>&1\"
            else
-               (KNULLI_ROOT='$ROOTFS' setsid nohup \$HOME/knulli-vm/run_app.sh '$dir' '$cmd' '${VNC_PASS:-knulli}' </dev/null > \$HOME/knulli-app.log 2>&1 &)
+               (KNULLI_ROOT='$ROOTFS' setsid nohup \$HOME/knulli-vm/run_app.sh b64:$(enc "$cwd") b64:$(enc "$cmd") '${VNC_PASS:-knulli}' '${VNC_PORT:-5901}' </dev/null > \$HOME/knulli-app.log 2>&1 &)
            fi" \
         || die "could not reach the guest to launch the app"
     # run_app.sh apt-installs xdotool/python3-xlib on a FIRST run (a
@@ -278,7 +347,7 @@ cmd_status() {
     gexec '
         printf "  joypad:  "; pgrep -f "virtual_joypad[.]py" >/dev/null && echo up || echo down
         printf "  display: "; { pgrep -x Xvnc >/dev/null || pgrep -x Xvfb >/dev/null; } && echo ":1 up" || echo down
-        printf "  vnc:     "; if pgrep -x Xvnc >/dev/null; then echo "Xvnc :5901 up"; elif pgrep -x x11vnc >/dev/null; then echo "x11vnc :5901 up"; else echo down; fi
+        printf "  vnc:     "; if pgrep -x Xvnc >/dev/null; then echo "Xvnc up on port '"${VNC_PORT:-5901}"'"; elif pgrep -x x11vnc >/dev/null; then echo "x11vnc up on port '"${VNC_PORT:-5901}"'"; else echo down; fi
         printf "  keymap:  "; pgrep -f "keymapd[.]py" >/dev/null && echo "keyboard->pad up" || echo "DOWN (knulli-vm keymap restart)"
         # ps -p, NOT kill -0: the tracked pid setuids to root via sudo inside
     # the chroot, and kill -0 from the guest user gives EPERM on a live
@@ -294,23 +363,49 @@ cmd_status() {
 # guest is listening but the host is not, open an ssh tunnel ourselves.
 VNC_TUNNEL_PIDF="$STATE/vnc.$VM.pid"
 
+# Is the Mac-side listener on $1 actually OURS? Lima forwards each VM's guest
+# 5901 to the Mac's 5901 and only ONE install can win that port; the loser's
+# forward never binds, so a plain "is something listening on 5901" probe says
+# yes while the window that opens is the OTHER VM's screen (two installs on
+# one Mac, or Screen Sharing already on 5901). lima's hostagent cmdline names
+# its own instance dir, which identifies whose forward this is.
+port_is_ours() {
+    local port="$1" pid tp
+    tp=$(cat "$VNC_TUNNEL_PIDF" 2>/dev/null)
+    for pid in $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); do
+        [ -n "$tp" ] && [ "$pid" = "$tp" ] && return 0
+        ps -p "$pid" -o command= 2>/dev/null | grep -q "/\.lima/$VM/" && return 0
+    done
+    return 1
+}
+
 cmd_vnc() {
-    if gexec 'ss -ltn | grep -q ":5901 "' 2>/dev/null; then
-        if ! nc -z 127.0.0.1 5901 2>/dev/null; then
+    local port="${VNC_PORT:-5901}"
+    if gexec "ss -ltn | grep -q \":$port \"" 2>/dev/null; then
+        if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
             local tp; tp=$(cat "$VNC_TUNNEL_PIDF" 2>/dev/null)
             if [ -z "$tp" ] || ! kill -0 "$tp" 2>/dev/null; then
-                echo "lima does not forward guest :5901 — starting ssh tunnel ..."
+                echo "lima does not forward guest :$port — starting ssh tunnel ..."
                 nohup ssh -F "$HOME/.lima/$VM/ssh.config" "lima-$VM" \
-                    -nNT -o ExitOnForwardFailure=yes -L 5901:localhost:5901 \
+                    -nNT -o ExitOnForwardFailure=yes -L "$port:localhost:$port" \
                     >/dev/null 2>&1 &
                 echo $! > "$VNC_TUNNEL_PIDF"
                 sleep 1
             fi
+        elif ! port_is_ours "$port"; then
+            # the port answers — just not for us. Saying "connect here" would
+            # send the user to a different machine's framebuffer.
+            local who; who=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+            echo "WARNING: Mac port $port is forwarded by something OTHER than VM '$VM'"
+            echo "         (pid ${who:-?}: $(ps -p "${who:-0}" -o command= 2>/dev/null | cut -c1-70))"
+            echo "         vnc://localhost:$port shows that display, not this one."
+            echo "         move this install: ./install.sh --vm-name $VM --vnc-port <free port>"
+            return
         fi
     else
-        echo "note: nothing is listening on guest :5901 — start the app first (knulli-vm start)"
+        echo "note: nothing is listening on guest :$port — start the app first (knulli-vm start)"
     fi
-    echo "vnc://localhost:5901  (password: ${VNC_PASS:-knulli})"
+    echo "vnc://localhost:$port  (password: ${VNC_PASS:-knulli})"
 }
 
 # The VNC keyboard -> pad mapper (keymapd.py). If keys stop mapping on the

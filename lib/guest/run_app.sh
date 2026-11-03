@@ -1,11 +1,20 @@
 #!/bin/bash
 # In-guest: bring up the virtual hardware (sound card, joypad, display, VNC)
 # and launch an app inside the KNULLI chroot the way knulli's
-# EmulationStation would (exec /usr/bin/pygame <script> with the app dir as
-# cwd; configgen/generators/pygame is the reference).
-#   usage: run_app.sh <app-dir-in-rootfs> <launch-cmd> [vnc-pass]
+# EmulationStation would (cd <app dir> && exec its launcher; configgen's
+# pygame generator is the reference).
+#   usage: run_app.sh <cwd> <launch-cmd> [vnc-pass] [vnc-port]
+#
+# <cwd>/<launch-cmd> arrive as "b64:<base64>" from the knulli-vm CLI because
+# both routinely contain spaces: an app installed the way its own README says
+# keeps the vendor's directory name ("grainbrick beta 1.0.1") and launches via
+# the vendor's stub ("sh './GrainBrick beta 1.0.1.sh'"), and nesting those
+# single quotes inside the ssh command line's own single quotes is how the
+# launch silently fell apart before. A payload with no b64: prefix is taken
+# literally, so an old CLI still drives a new guest script.
 set -u
-DIR="$1"; CMD="$2"; VNC_PASS="${3:-knulli}"
+decode() { case "$1" in b64:*) printf %s "${1#b64:}" | base64 -d;; *) printf %s "$1";; esac; }
+DIR="$(decode "$1")"; CMD="$(decode "$2")"; VNC_PASS="${3:-knulli}"; VNC_PORT="${4:-5901}"
 G="$HOME/knulli-vm"
 # All our logs live under $HOME, never /tmp: root-era units left root-owned
 # /tmp/*.log behind, and the sticky bit then blocks a guest-user `> log`
@@ -55,7 +64,10 @@ MARK="$LOGD/vnc.passwd-md5"
 # sockets". Ensure the conventional mode (idempotent).
 sudo mkdir -p /tmp/.X11-unix 2>/dev/null
 sudo chmod 1777 /tmp/.X11-unix 2>/dev/null
-want=$(printf '%s|v4-nosetsize' "$VNC_PASS" | md5sum | cut -d' ' -f1)
+# the port is part of the marker: a re-install that moved this VM off 5901
+# (another install already owns it — see install.sh) must not leave an Xvnc
+# bound to the old one behind with the marker claiming it is configured
+want=$(printf '%s|%s|v5-port' "$VNC_PASS" "$VNC_PORT" | md5sum | cut -d' ' -f1)
 if command -v Xvnc >/dev/null 2>&1; then
     if pgrep -x Xvnc >/dev/null 2>&1 && [ "$(cat "$MARK" 2>/dev/null)" = "$want" ]; then
         :
@@ -73,7 +85,7 @@ if command -v Xvnc >/dev/null 2>&1; then
         sudo rm -f /tmp/knulli-vnc.pass 2>/dev/null
         printf '%s\n%s\n' "$VNC_PASS" "$VNC_PASS" | vncpasswd -f > /tmp/knulli-vnc.pass
         chmod 600 /tmp/knulli-vnc.pass
-        (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport 5901 \
+        (setsid nohup Xvnc :1 -geometry 1280x720 -depth 24 -rfbport "$VNC_PORT" \
             -SecurityTypes VncAuth -PasswordFile /tmp/knulli-vnc.pass \
             -AlwaysShared -localhost yes -AcceptSetDesktopSize=0 \
             > "$LOGD/xvnc.log" 2>&1 &)
@@ -91,7 +103,7 @@ else
     if [ "$x_ok" = 0 ]; then
         sudo pkill -x x11vnc 2>/dev/null; sleep 1
         x11vnc -display :1 -forever -shared -passwd "$VNC_PASS" \
-            -rfbport 5901 -bg -o "$LOGD/x11vnc.log" >/dev/null 2>&1; sleep 1
+            -rfbport "$VNC_PORT" -bg -o "$LOGD/x11vnc.log" >/dev/null 2>&1; sleep 1
         echo "$want" > "$MARK"
     fi
 fi

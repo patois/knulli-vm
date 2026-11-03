@@ -9,7 +9,9 @@
 #   ./install.sh --image-url https://.../x.img.gz  # fetch a specific build
 #   ./install.sh --image-device knulli-h700-rg-cubexx
 #   ./install.sh --app ~/Downloads/GrainBrick_beta_1.0_TrimUI_Brick_KNULLI.zip
-#   ./install.sh --vm-name other --vnc-pass secret --app <dir-or-url> ...
+#   ./install.sh --vm-name other --vnc-port 5902 --vnc-pass secret --app <url>
+#                                                  # (two installs on one Mac
+#                                                  #   cannot both own 5901)
 #
 # Nothing downloaded lands in git (see .gitignore). The KNULLI image itself
 # cannot boot under Virtualization.framework (device SoC firmware); we boot
@@ -19,7 +21,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 STATE="$HERE/state"; DL="$HERE/downloads"
 
 VM="knulli-vm"; IMAGE=""; IMAGE_URL=""; DEVICE="knulli-a133-trimui-brick"
-VNC_PASS="knulli"; APPS=()
+VNC_PASS="knulli"; VNC_PORT=5901; APPS=()
 
 die() { echo "install: $*" >&2; exit 1; }
 say() { echo ">>> $*"; }
@@ -45,8 +47,9 @@ while [ $# -gt 0 ]; do
         --image-device) DEVICE="$2"; shift 2;;
         --vm-name) VM="$2"; shift 2;;
         --vnc-pass) VNC_PASS="$2"; shift 2;;
+        --vnc-port) VNC_PORT="$2"; case "$VNC_PORT" in (*[!0-9]*|'') die "--vnc-port needs a number, got '$2'";; esac; shift 2;;
         --app) APPS+=("$2"); shift 2;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0;;
+        -h|--help) sed -n '2,22p' "$0"; exit 0;;
         *) die "unknown flag $1";;
     esac
 done
@@ -243,6 +246,31 @@ wait $hp || die "SDL2 x11-compat build failed"
 limactl shell "$VM" -- bash -lc "~/knulli-vm/setup_audio.sh '$ROOTFS'" \
     || say "WARNING: audio setup failed (the app will be silent)"
 
+# ---- 5c. VNC port ---------------------------------------------------------------
+# Lima forwards the guest's VNC port to the SAME port on the Mac, and only one
+# install can own 5901: a second install's forward silently never binds, so
+# `knulli-vm vnc` printed a URL whose liveness probe passed — and the window it
+# opened was the FIRST VM's screen. (Same trap if Screen Sharing or anything
+# else on the Mac already serves that port.) Claim a port that is free, or
+# already ours, so a re-run of an existing install keeps the port it has.
+port_usable_by_us() {
+    local p="$1" pid
+    for pid in $(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null); do
+        ps -p "$pid" -o command= 2>/dev/null | grep -q "/\.lima/$VM/" || return 1
+    done
+    return 0
+}
+if ! port_usable_by_us "$VNC_PORT"; then
+    say "Mac port $VNC_PORT is already served by another VM or app"
+    want=$VNC_PORT
+    until port_usable_by_us "$VNC_PORT"; do
+        VNC_PORT=$((VNC_PORT + 1))
+        [ "$VNC_PORT" -gt $((want + 50)) ] && \
+            die "no free VNC port in $want..$((want + 50)) — pick one with --vnc-port"
+    done
+    say "using VNC port $VNC_PORT for this install (vnc://localhost:$VNC_PORT)"
+fi
+
 # ---- 6. config ------------------------------------------------------------------
 # Write via a temp only if the whole block SUCCEEDS. The old trailing
 # `[ -f "$CONF" ] && grep ...` made the block exit 1 on every FRESH install
@@ -255,6 +283,7 @@ CONF="$STATE/$VM.conf"
     echo "VM_NAME=$VM"
     echo "ROOTFS=$ROOTFS"
     echo "VNC_PASS=$VNC_PASS"
+    echo "VNC_PORT=$VNC_PORT"
     echo "IMAGE=$IMAGE"
     grep '^DEFAULT_APP=' "$CONF" 2>/dev/null || true
 } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF" || die "could not write $CONF"
