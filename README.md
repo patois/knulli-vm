@@ -389,9 +389,11 @@ bin/                    built host binaries (gitignored)
   killed the pipe mid-session, `knulli-vm audio start` (or restart the app).
 - **"App outputs pure silence" but its own meters animate** — suspect the
   *capture*, not the app. Ground truth is in the guest:
-  `sudo cat /proc/asound/card1/pcm0p/sub*/status` — the cable that matters is
-  the sub whose `hw_ptr` **advances in real time** (`state: RUNNING` alone
-  lies), and the same sub under `pcm1c/` is what to capture. `pgrep -a -x
+  `sudo cat /proc/asound/card2/pcm0p/sub*/status` — under the static dmix
+  wiring there is exactly **one** sub in `state: RUNNING` and its `hw_ptr` must
+  advance in real time (`state: RUNNING` alone lies); more than one running
+  playback sub means something bypassed the mixer. The cable is
+  `hw:Loopback,1,0` either way — no sub to hunt for any more. `pgrep -a -x
   aplay` tells you which flavour you're running: GrainBrick ≤ 1.0 pumps
   through a child `aplay` (its sub *is* the main output), 1.0.1+ writes ALSA
   itself and spawns none. A second `gb_launch` process means an orphaned app
@@ -400,24 +402,27 @@ bin/                    built host binaries (gitignored)
   `sudo pkill -f 'gb_launch[.]py'` plus `sudo pkill -x aplay`. A sub in
   `state: XRUN` produces exactly the pure zeros that get mistaken for a
   silent app.
-- **Clock healthy, bytes all zero — the app's render loop never engaged** —
-  there is a third failure mode besides "wrong cable" and "underrun": the
-  stream is real, the clock is real-time, and the app is writing *silence*.
-  Measure it rather than argue with it: stop the Mac pipe (`knulli-vm audio
-  stop`), capture the cable to a file yourself (`sudo arecord -D
-  hw:Loopback,1,<sub> -f S16_LE -r 48000 -c 2 -t raw -q` for a few seconds),
-  and compute RMS/peak/`nonzero%`; then prove the *path* with a tone you know
-  is loud (`aplay -D default /tmp/sine.wav` in the chroot — a healthy path
-  reads back a nonzero RMS and a nonzero-sample share, so the VM is then
-  exonerated). With GrainBrick 1.0.1 in this state the app's own meters said
-  GRAIN STATE ON / ACTIVE GRAINS 2 / DSP 1%, its audio subprocess fed the
-  pump at exactly 192 kB/s (= 48 kHz stereo 16-bit) while burning ~3% of a
-  core, and both of its cables read `RMS 0.0 peak 0 nonzero 0.00%` — a
-  real-time stream of zeros, with the UI still fully responsive. That is the
-  app's audio process, not the VM; take those numbers (plus the app's own
-  `audio_process.log`, which ends at `AUDIO OUTPUT STARTED: default`) to the
-  app's author. Same signature as a device that plays one note, then hangs at
-  100% CPU while the UI keeps answering.
+- **Clock healthy, bytes all zero — prove the path before blaming the app.**
+  This entry used to be titled "the app's render loop never engaged", and that
+  conclusion was **wrong**; keep the measurement, drop the verdict. What was
+  recorded on 2026-11-03: GrainBrick 1.0.1's meters said GRAIN STATE ON / ACTIVE
+  GRAINS 2, its audio subprocess fed the pump at exactly 192 kB/s (= 48 kHz
+  stereo 16-bit) while burning ~3% of a core, and both cables read
+  `RMS 0.0 peak 0 nonzero 0.00%` with the UI fully responsive — written up as
+  "the app is writing silence, take it to the app's author". It was the VM: the
+  run-time substream chooser was reading the app's always-on monitor stream,
+  which clocks *digital silence at full rate*, while real audio played on another
+  sub. Static dmix wiring removed the choice, and the same app is audible.
+  So measure, in this order: stop the Mac pipe (`knulli-vm audio stop`), capture
+  the one cable yourself (`sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c
+  2 -t raw -q` for a few seconds) and compute RMS/peak/`nonzero%`; then prove the
+  path with a tone you know is loud (`aplay -D default /tmp/sine.wav` in the
+  chroot — a healthy path reads back nonzero RMS and a nonzero-sample share).
+  Only once the path is exonerated *and* the app's stream is the single running
+  sub is a zero-filled capture the app's doing; `audio_process.log` (ending at
+  `AUDIO OUTPUT STARTED: default`) is the companion evidence. Separately: a
+  device that plays one note, then hangs at 100% CPU while the UI keeps answering
+  was seen on real hardware and is still unexplained.
 - **VNC shows the *other* VM's screen** — two installs cannot both own 5901
   (Lima forwards the guest port to the same port on the Mac, and the second
   forward never binds). `install.sh` picks a free port for later installs and
