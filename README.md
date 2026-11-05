@@ -1,159 +1,183 @@
 # knulli-vm
 
-Run **apps built for the TrimUI Brick / KNULLI Linux** (like
-[GrainBrick](https://github.com/ETRNLIAM/GrainBrick)) directly on your Mac,
-inside the *actual* KNULLI userspace taken from a real knulli device image.
+Run **apps built for the TrimUI Brick / KNULLI Linux** — like
+[GrainBrick](https://github.com/ETRNLIAM/GrainBrick) — on an Apple Silicon Mac,
+inside the *actual* KNULLI userspace taken from a real knulli device image. The
+app runs unmodified against knulli's own Python 3.12, knulli's system pygame,
+knulli's ALSA stack and knulli's own `/usr/bin/pygame` launcher, installed under
+`/userdata/roms/ports/` exactly like on the device. You see its screen over VNC,
+hear it through the Mac's speakers, and drive it with the Mac's keyboard or a
+gamepad.
 
-KNULLI images are Allwinner/Rockchip device firmware and cannot boot under
-Virtualization.framework. This project boots a stock Ubuntu 24.04 arm64 Lima
-VM and **chroots the OS squashfs from the knulli image** instead — the app
-then runs against knulli's own CPython 3.12, knulli's system pygame, knulli's
-ALSA stack, and knulli's own `/usr/bin/pygame` launcher (the same one
-EmulationStation execs for pygame ports on the device), installed under
-`/userdata/roms/ports/` exactly like on hardware.
+KNULLI images are device firmware (Allwinner/Rockchip SoC, vendor GPU blob) and
+cannot boot in a Mac VM, so knulli-vm boots a normal Ubuntu 24.04 arm64 VM with
+[Lima](https://github.com/lima-vm/lima) and **chroots the OS squashfs** out of
+the knulli image instead. One library is swapped: knulli's SDL2 only knows the
+device's GPU, so the installer builds stock SDL2 with X11 alongside it. Nothing
+else is substituted and the app is never modified.
 
-## What this is / isn't
+## What it can do
 
-- **Not included in git** (created at install time, `.gitignore`d): the knulli
-  image, the extracted rootfs, SDL2 sources/builds, app archives, venvs. The
-  repo contains only the tooling.
-- One deliberate substitution: knulli's SDL2 has a single video driver,
-  `mali` (the device's GPU blob; the image ships no X11/kmsdrm/framebuffer).
-  The installer builds stock **SDL2 2.32.x with X11** and shadows only that
-  soname via `LD_LIBRARY_PATH` (`/opt/sdl2-x11`). Knulli keeps its own glibc,
-  libasound, SDL2_ttf/image/mixer — and the built SDL satisfies the ≥2.32.8
-  floor knulli's pygame enforces ("SDL downgrade" check).
-- The app itself is never modified; run as distributed.
+- Run KNULLI/Brick apps as distributed — no recompiled or patched binaries.
+- Show the app's screen at 1280×720 in macOS Screen Sharing over VNC.
+- Play the app's sound on the Mac, about **50 ms** behind the app — usable for
+  playing an instrument, not for pro-audio monitoring.
+- Feed the app's **record** inputs with real signal: the Mac's microphone into
+  the app's BUILT-IN MIC, and whatever the Mac is playing into the app's
+  USB AUDIO input.
+- Turn the Mac's keyboard into the Brick's buttons, or bridge a physical
+  USB/Bluetooth gamepad plugged into the Mac.
+- Install several apps, upgrade them in place, and keep the user's samples,
+  recordings, projects and settings while doing it.
 
-## Requirements — what to get and where from
+## What it cannot do
 
-| piece | where |
-|---|---|
-| Apple Silicon Mac + Homebrew | <https://brew.sh> (`brew install lima`) |
-| Lima (VM host) | <https://github.com/lima-vm/lima> |
-| Xcode Command Line Tools | `xcode-select --install` (needed only for `swiftc` → the host audio player; everything else installs without it, you just get no sound) |
-| KNULLI image | **fetched automatically** by `install.sh` from the latest release of <https://github.com/knulli-cfw/distribution> (project site: <https://knulli.org>); manual download / other devices: pick the `.img.gz` asset whose prefix matches your device — e.g. `knulli-a133-trimui-brick-*.img.gz` for the original TrimUI Brick — and pass `--image` / `--image-device`. The device list lives on the releases page: <https://github.com/knulli-cfw/distribution/releases> |
-| TrimUI Brick hardware info / official firmware | <https://www.trimui.com> (KNULLI is the community replacement; the StockOS is TrimUI's own) |
-| Apps, e.g. GrainBrick | the app's own releases page — GrainBrick: <https://github.com/ETRNLIAM/GrainBrick/releases> (grab the release ZIP, not GitHub's "Source code" archives); then `./knulli-vm app add <zip-or-url>` |
+- **It is not a KNULLI device.** No EmulationStation, no PORTS menu, no
+  booting the knulli image — you start apps with `knulli-vm start`. There is no
+  device GPU, no device display, no device firmware, so "works here" and "works
+  on the Brick" are not the same claim.
+- **Apple Silicon Macs only.** The guest is arm64, so Intel Macs are out, and
+  the installer is macOS-only.
+- **No USB passthrough.** Lima/vz has no USB. The app's "USB AUDIO" input is
+  the Mac's own audio by design; you cannot attach a real USB audio interface
+  or USB MIDI controller.
+- **No analog sticks.** The Brick has none, so neither does the emulated pad —
+  no L3/R3. `FN` is a hardware hotkey modifier on the device, not a button the
+  app can receive.
+- **Still screenshots only, no video capture** (`knulli-vm screenshot`).
+- **No apps included.** knulli-vm is tooling only; you bring the app ZIP.
+- The original TrimUI Brick image is the verified target. `--image-device` will
+  install another KNULLI device's userspace, but that path hasn't been retested
+  since the audio and input work.
+- Apps run as root *inside the chroot* — that is knulli's own model, and the VM
+  is the sandbox. Treat images and app archives you feed it as untrusted.
 
-Nothing else needs downloading by hand: the Ubuntu arm64 VM image is pulled by
-Lima, and the SDL2 source by the installer.
+## What you supply, what the installer fetches
+
+| | You supply? | Needed? |
+|---|---|---|
+| Apple Silicon Mac | ✔ you | **mandatory** |
+| This repo | ✔ you (clone or copy) | **mandatory** |
+| [Homebrew](https://brew.sh) | ✔ you | **mandatory** |
+| Lima — `brew install lima` | ✔ you | **mandatory** |
+| The app ZIP (e.g. GrainBrick) | ✔ you, from the app's own releases page | **mandatory to run an app** — knulli-vm ships none |
+| Xcode Command Line Tools — `xcode-select --install` | ✔ you | recommended — this is the *only* way to get **sound**. Without `swiftc` everything installs, but the app is silent and recording is unavailable |
+| macOS permission prompts (Microphone, Screen Recording) | ✔ you, by clicking | only when you use `knulli-vm feed` |
+| KNULLI device image (~2 GB) | installer fetches it | automatic — sha256-verified, from [knulli-cfw/distribution](https://github.com/knulli-cfw/distribution/releases). Only fetch it yourself for a specific build or device |
+| Ubuntu 24.04 arm64 VM image | Lima | automatic |
+| Guest packages (TigerVNC, xdotool, imagemagick, python3-xlib, squashfs-tools, alsa-utils) | installer (apt inside the VM) | automatic |
+| SDL2 source for the X11 build | installer | automatic |
+| Python venv for gamepad reading (`pygame-ce`) | `knulli-vm`, the first time you run `bridge` | automatic |
+
+Nothing else needs downloading by hand. Budget roughly **15 GB of disk**: the VM
+disk grows to about 11 GB in use, of which the extracted KNULLI userspace is
+~4.7 GB. The VM is configured for 4 vCPUs and 8 GB RAM.
 
 ## Install
 
-```sh
-./install.sh                    # downloads the latest knulli image for the
-                                # TrimUI Brick (knulli-cfw/distribution)
-./install.sh --image ./knulli-a133-trimui-brick-...img      # local image file
-./install.sh --image-url https://.../knulli-....img.gz      # specific build
-./install.sh --image-device knulli-h700-rg-cubexx           # other devices
-./install.sh --app ~/Downloads/GrainBrick_beta_1.0_TrimUI_Brick_KNULLI.zip
-./install.sh --vm-name studio --vnc-port 5902    # a second install on this Mac
-```
-
-The installer: creates the Lima VM (`vm/knulli.yaml`) → deploys guest scripts
-→ fetches/verifies (sha256) the image → extracts the OS squashfs
-(`lib/guest/extract_knulli.sh`; the GPT first-LBA sits at partition-entry
-offset **32**, a classic parsing trap) → builds the SDL2 x11 compat library
-→ sets up guest→Mac audio routing → builds the host audio player → installs
-any `--app` you pass. Re-running it is safe: slow steps (VM, extraction,
-SDL build) detect existing state and skip.
-
-**Two installs on one Mac.** Lima forwards a VM's VNC port to the *same* port
-on the Mac, so only one install can own 5901 — and a second install's forward
-silently never binds, which means its `vnc://localhost:5901` shows the *first*
-VM's screen. `install.sh` therefore checks the port before claiming it: if
-something else already serves it (another knulli-vm install, Screen Sharing),
-it takes the next free port and says so. Pass `--vnc-port` to pick one;
-`knulli-vm vnc` and `knulli-vm status` always report the port that install
-actually owns, and `vnc` refuses to hand out a URL served by a different VM.
-
-## Using it
+### 1. Prerequisites
 
 ```sh
-./knulli-vm start              # start services + default app (e.g. GrainBrick)
-./knulli-vm vnc                # print this install's VNC URL + password
-open vnc://localhost:5901      # ...or type it: macOS Screen Sharing, pass 'knulli'
-./knulli-vm status             # VM / services / app / apps (+ which port)
-./knulli-vm screenshot         # grab the display to a PNG
-./knulli-vm stop               # stop the app (VM keeps running)
-./knulli-vm down               # shut the VM down too (stops app + audio first)
-./knulli-vm down --force       # ...hard kill, for a wedged guest that ignores
-                               #    graceful shutdown
-./knulli-vm up                 # bring a stopped VM back (waits for ssh, not
-                               #    just the hypervisor, before reporting up)
+brew install lima                                  # mandatory (needs Homebrew)
+xcode-select --install                             # optional, but it is the only
+                                                   #   way to get sound
+git clone https://github.com/patois/knulli-vm      # mandatory
+cd knulli-vm
 ```
 
-`stop` vs `down`: `stop` kills the app tree and audio pipe inside the VM;
-`down` does that first, then shuts the VM itself off (frees its RAM/CPU;
-everything on disk is kept). Re-run `./install.sh` any time to heal a VM
-after updates — it re-deploys guest scripts and re-verifies the SDL2 x11
-closure.
+Skipping `xcode-select --install` is fine for the screen and the controls — the
+app just plays silently, and `feed` is unavailable. Install it and re-run
+`./install.sh` when you want audio.
 
-**Apps** (install time or later; zip, directory, or URL):
+### 2. Run the installer (mandatory)
 
 ```sh
-./knulli-vm app add <zip|dir|url> [--name N] [--cmd C] [--default]
-./knulli-vm app list            # knulli-vm app default NAME | app rm NAME
-./knulli-vm start someapp
+./install.sh
 ```
 
-The zip is installed **as the device would install it**: a single top-level
-directory inside the zip wins as the app root even with a loose `*.sh` next to
-it (that `.sh` is KNULLI's launcher stub, not the app), the vendor's own
-spelling is kept verbatim — `ports/grainbrick beta 1.0.1/` plus its sibling
-`ports/GrainBrick beta 1.0.1.sh`, spaces and all — and when a stub is present
-it is what gets run (`cd ports && sh './GrainBrick beta 1.0.1.sh'`), because
-the stub hardcodes its app dir (`APP='/userdata/roms/ports/grainbrick beta
-1.0.1'`) and does the first-run setup: creating and seeding `samples/`,
-`projects/` and `recordings/` from `demo-samples/`/`demo-projects/`.
-Sanitizing the directory name to something shell-friendly used to break that
-lookup, so the stub was skipped and a fresh install showed an **empty sample
-browser** the device would never show. Names with spaces are carried
-base64-encoded to the guest instead of being mangled.
+That single command creates the VM, deploys the guest scripts, resolves and
+downloads the latest KNULLI image for the TrimUI Brick, verifies its sha256,
+extracts the userspace, builds the SDL2 X11 library, sets up the audio routing,
+builds the Mac audio bridges, and writes the install's config. Slow steps print
+a ticking timer (`>>> extracting rootfs ... 45s`) — that is progress, not a hang.
+Re-running `./install.sh` at any time is safe and is the way to heal an install
+after updates: finished steps detect existing state and skip, so the 2 GB image
+is not re-downloaded.
 
-Only when a zip ships no stub does knulli-vm guess an entry point inside the
-app dir (`gb_launch.py` → `main.py` → `run.sh` → a lone `*.sh`; override with
-`--cmd`).
-Re-adding an app name upgrades it in place while preserving the user's
-`samples/`, `recordings/`, `projects/` and `*.json` settings inside the app
-dir — same contract the app's own README promises for device upgrades.
+### 3. Add the app you want to run (mandatory, once per app)
 
-**Input.** The VM has an emulated `retrogame_joypad` — a uinput replica of
-knulli's `rocknix-joypad` kernel driver **on the TrimUI Brick specifically**:
-same device name GrainBrick checks for, and the exact evdev code set the real
-driver registers (four 0x120-block codes first, then the face buttons
-*positionally* — printed B=BTN_SOUTH, A=BTN_EAST, X=BTN_NORTH, Y=BTN_WEST —
-L1–R2, SELECT/START/MODE, and the two stick-click codes 0x13D/0x13E
-repurposed as the Brick's TAB-/TAB+ keys, i.e. F1/F2; BTN_C/BTN_Z are *not*
-registered). SDL numbers joystick buttons by ascending code, so matching the
-set exactly is what makes the app's default mapping (B=4 A=5 Y=6 X=7 L1=8
-R1=9 L2=10 R2=11 SELECT=12 START=13 TAB-=15 TAB+=16) land on the right
-buttons. At the SDL layer it's indistinguishable from the onboard pad:
+knulli-vm ships no apps. Get the app's own release ZIP — for GrainBrick, from
+<https://github.com/ETRNLIAM/GrainBrick/releases> (the release asset, **not**
+GitHub's auto-generated "Source code" archives) — then:
 
 ```sh
-./knulli-vm input "hat down 150"        # tap; holdhat down / holdhat none for held
-./knulli-vm input "press Y"             # names: A B X Y L1 R1 L2 R2 SELECT
-                                        # START MODE TAB- TAB+ (F1/F2 and
-                                        # SOUTH/EAST/NORTH/WEST/TL/TR/... alias)
-./knulli-vm bridge                      # physical USB/BT pad plugged into the Mac
+./knulli-vm app add ~/Downloads/GrainBrick_beta_1.0_TrimUI_Brick_KNULLI.zip
 ```
 
-`bridge` reads the pad with pygame-ce/SDL2 on the Mac and streams held
-button/dpad states into the VM over one ssh pipe — the app's own repeat
-profiles then behave natively. (USB *passthrough* isn't possible: Lima/vz
-exposes no USB, and Virtualization.framework's gamepad support is nil. The
-bridge deliberately runs SDL's default *cocoa* video driver: the dummy
-driver never pumps the Cocoa runloop that delivers pad-connect callbacks, so
-an already-plugged pad stayed invisible until replug.) Button indices come
-from a measured sweep of the real pad, not the assumed "standard" order —
-see **Remapping inputs**.
+A direct download URL works too (`app add https://.../GrainBrick_...zip`), as
+does a plain directory.
 
-**Keyboard.** While the VNC window has Mac keyboard focus, the keys are
-mapped to the pad too (`lib/guest/keymapd.py` taps X11 globally without
-grabbing, so the app still sees raw keys if it wants them). The map mirrors
-the Brick's own panel — dpad on the left, SNES-lettered face cluster on the
-right (X top, A right, B bottom, Y left), triggers under L1/R1:
+### 4. Start it and connect
+
+```sh
+./knulli-vm start            # services + the default app + sound to the Mac
+./knulli-vm vnc              # prints this install's VNC URL and password
+open vnc://localhost:5901    # macOS Screen Sharing; password: knulli
+```
+
+Then just play: the keyboard map is below, sound comes out of the Mac.
+
+### Optional install variations
+
+Pass these to `./install.sh` instead of the bare command:
+
+| Flag | Use it when |
+|---|---|
+| `--app <zip-or-url>` | you already have the app and want it installed during install (repeatable) |
+| `--image ./knulli-a133-trimui-brick-….img` | you downloaded a specific image yourself |
+| `--image-url https://…/knulli-….img.gz` | fetch a specific build from the releases page |
+| `--image-device knulli-h700-rg-cubexx` | a different KNULLI device (asset prefix must match) |
+| `--vm-name studio --vnc-port 5902` | a **second install on this Mac** — see below |
+| `--vnc-pass secret` | change the VNC password (stored in `state/`, gitignored) |
+
+**Two installs on one Mac.** Lima forwards a VM's VNC port to the *same* port on
+the Mac, so only one install can own 5901 and a second one's forward silently
+never binds — its URL would show the *first* VM's screen. The installer therefore
+checks the port and takes the next free one, saying so. `knulli-vm vnc` and
+`status` always report the port that install really owns, and `vnc` refuses to
+hand out a URL some other VM serves. Give each install its own `--vm-name`.
+
+## Day to day
+
+```sh
+./knulli-vm start              # start services + default app (audio included)
+./knulli-vm start someapp      # start a specific installed app
+./knulli-vm vnc                # this install's VNC URL + password
+./knulli-vm status             # VM / display / audio / feeds / apps / port
+./knulli-vm screenshot         # save the display as knulli-vm-shot.png
+./knulli-vm stop               # stop the app; the VM keeps running
+./knulli-vm down               # also shut the VM off (frees RAM/CPU, disk kept)
+./knulli-vm down --force       # ...hard kill, for a guest ignoring shutdown
+./knulli-vm up                 # bring a stopped VM back up
+./knulli-vm help               # everything, with the input vocabulary
+```
+
+`stop` vs `down`: `stop` kills the app and its audio pipe *inside* the VM;
+`down` does that first and then turns the VM off. Note that `stop` also stops any
+recording feeds you had running — it prints which ones, so you can bring them
+back with `feed mic` / `feed usb`.
+
+Everything else has its own section below: `input` and `bridge` (controls),
+`audio` and `feed` (sound), `keymap` (keyboard not mapping), `app` (installing
+and upgrading apps), and `--vm NAME` in front of any command to drive a second
+install on the same Mac.
+
+## Controls
+
+**Keyboard.** While the VNC window has focus, the keys map to the Brick's
+buttons. The layout mirrors the device's own panel — dpad left, SNES-lettered
+face cluster right (X top, A right, B bottom, Y left), triggers under the
+shoulders:
 
 | keys | Brick button | keys | Brick button |
 |---|---|---|---|
@@ -162,316 +186,184 @@ right (X top, A right, B bottom, Y left), triggers under L1/R1:
 | J | A (right) | BackSpace | SELECT |
 | U or X | X (top) | Enter, space | START |
 | I | Y (left) | m | MENU (logo) |
-| F1 / F2 | TAB-/TAB+ (the Brick's F1/F2) | | |
+| F1 / F2 | TAB- / TAB+ | | |
 
-The Brick has no analog sticks, so there is no L3/R3; FN is a gpio-keys OS
-hotkey modifier, not a joystick event, so it has no mapping (F1/F2 *are*
-joystick TAB-/TAB+ on the real device and are mapped as such, while also
-reaching the app as raw keys through the same passive tap).
+If keys stop mapping, `./knulli-vm keymap restart` fixes it in a second;
+`keymap log` then shows every mapped key it receives.
 
-Fast taps are stretched to a minimum hold — **120 ms for buttons, 220 ms for
-dpad steps** (measured against GrainBrick: its buttons are event-driven and
-catch 80 ms taps, but it debounces hat steps under ~200 ms) — and keyboard
-auto-repeat is absorbed as a single held key.
+**Physical gamepad.** `./knulli-vm bridge` reads a USB/Bluetooth pad plugged
+into the Mac and streams it into the VM — held buttons stay held, so the app's
+own auto-repeat behaves natively. Stop it with Ctrl-C.
 
-**Audio.** The guest has no sound device, so the whole sound system is
-`snd-aloop` loopback cards — three of them, indices pinned by
-`lib/guest/setup_audio.sh` because every number is load-bearing: **card 0
-`Codec`** stands in for the device's built-in codec (GrainBrick's BUILT-IN MIC
-preset is a hardcoded `hw:0,0`), **card 1 `USBAudio`** is the emulated USB
-interface the app records from (GrainBrick 1.0 hardcodes `hw:1,0`, 1.0.1+
-resolves it by name — index 1 under both spellings serves every build), and
-**card 2 `Loopback`** is the app's output path. `snd-dummy` used to occupy
-card 0; it can only ever hand a capture path silence, and its claim on index 0
-makes aloop refuse to probe at all (`cannot find the slot for index 0,
-error: -16`). Each card is created with **two PCM devices** (`pcms=2,2,2`)
-because the aloop cables are *cross-wired* — device 0 playback ↔ device 1
-capture, same substream number, while same-numbered pairs carry nothing — so a
-one-device card has no far end for its cable at all.
-
-For **output**: the chroot's ALSA `default` **mixes** every playback client
-through `dmix` onto ONE aloop substream, and `knulli-vm audio start` (run
-automatically by `start`) captures the far end — `hw:Loopback,1,0` — over ssh
-into `bin/audioplay`, a tiny CoreAudio sink on the Mac. One cable, fixed for the
-life of the card: nothing is discovered, chosen or re-chosen while music is
-playing. `tools/audio_static_mix_test.sh` is the proof — two clients through
-`default`, both caught mixed on that one cable, with the app holding its
-always-on monitor stream.
-
-Why a mixer instead of picking a substream: snd-aloop hands out one substream
-per opened stream (cable N = playback subN → capture subN), and GrainBrick opens
-several — an always-on monitor/live-mix stream plus the `aplay` its audio pump
-spawns — so a capture pinned to one of them hears only that one. Hardcoding sub0
-once meant hours of "the app outputs pure silence" while an orphaned app
-instance held sub0 in XRUN and real audio flowed on sub3, unseen.
-
-Choosing at run time was the intermediate step, and it was worse. The app's
-monitor stream clocks *digital silence at full rate* (`hw_ptr` climbing 48000
-frames/s, peak 1), so a chooser that picks by motion wires the Mac to silence
-whenever the app is idle at pipe-start — the ordinary case, since `start` brings
-the pipe up before anyone presses play. A chooser that re-measures *content*
-while streaming does find the right cable, but it charges for the looking:
-probing means briefly not draining the stream you hold, and switching means
-reopening the cable, so the note you are playing gets a gap and a crackle in the
-middle of it. `dmix` removes the question instead of answering it faster — every
-client shares one hardware substream, so there is exactly one cable to read and
-it exists the moment the card does. `plug` in front converts whatever a client
-asks for (mono, 44.1 kHz) into that mix, and `default` is an `asym` pair because
-dmix is playback-only: capture stays device 0's capture, the cable nothing
-writes, so `arecord -D default` still opens and an idle mic reads silence
-instead of being echoed the app's own output.
-
-**Where the latency actually is.** Everything scheduled on an
-`AVAudioPlayerNode` renders *later*, so the depth of that queue **is** the delay
-you hear — and `audioplay` used to schedule every buffer immediately and throttle
-only above 250 ms. The guest produces at exactly realtime, so the queue filled to
-~250-300 ms and **never drained**: measured median 297 ms, dead flat from
-t = 0.5 s to 7.5 s, and every hiccup added delay that was never returned. A
-policy that only ever waits can get slower forever and never faster.
-
-`audioplay` now holds the queue at two chunks and reports its own depth —
-`AUDIOPLAY_DEBUG=1` prints schedule→render completion twice a second on stderr
-(measured, not inferred from a counter; and on stderr because stdout is
-block-buffered when redirected, which silently ate a whole measurement). On the
-live path that is **~52 ms**, flat over 9.5 s, versus 297 ms before. The rest of
-the chain is the dmix ring (21 ms periods / 85 ms buffer), `arecord -B 100000
--F 25000`, and 25 ms chunks; if it still feels late, shrink the dmix ring next —
-but it belongs to whichever client opens the mixer first (the app's monitor
-stream), so a new size only takes effect when the app restarts.
-
-**Recording (host → guest).** GrainBrick records from two sources and lets you
-toggle between them in the app: the **BUILT-IN MIC** (`hw:0,0`, 48 kHz mono)
-and a **USB AUDIO** device (`plughw:CARD=USBAudio,DEV=0`, 48 kHz stereo). The
-VM fakes both capture devices; what makes them *real* is `knulli-vm feed`:
+**From the shell** — useful for scripting a UI path:
 
 ```sh
-./knulli-vm feed usb      # what the Mac is PLAYING  -> the app's USB source
-./knulli-vm feed mic      # the Mac's MICROPHONE     -> the app's BUILT-IN MIC
-./knulli-vm feed status          # feed stop [usb|mic|all]; --source overrides
+./knulli-vm input "hat down 150"    # tap the dpad; holdhat down / holdhat none to hold
+./knulli-vm input "press Y"         # A B X Y L1 R1 L2 R2 SELECT START MODE TAB- TAB+
 ```
 
-The defaults *are* the design: the app's "USB" input is the host's own audio,
-never a USB device passed through — `lib/host/audiocap.swift` reads the Mac
-through CoreAudio only (AVAudioEngine's input node for `mic`, ScreenCaptureKit
-for `system`), and the bytes travel down an ssh pipe into
-`lib/guest/audio_feed.sh`, which writes the *playback* end of the cross-cable
-the app's `arecord` holds. Both feeds run at the same time; the app's
-source toggle simply picks which cable it is reading. Three things the path
-handles so it doesn't lie:
+## Sound
 
-- **Format match before bytes.** The feed first asks `audio_feed.sh --probe`
-  for the app's live capture `hw_params` (rate/channels/sub) and sizes
-  `audiocap`'s output to them — the two ends of an aloop cable share ONE ring
-  buffer, so a rate mismatch is a pitch shift, not an error. Nothing
-  recording yet? The feed uses the app's own preset (48 k stereo / mono) and
-  feeds sub 0, which the app will then be handed when it opens.
-- **Sub discovery, same rule as output.** ALSA hands out the next free
-  substream, so `--sub` is matched to the app's open stream when there is one
-  and never hardcoded; a leftover holder shifts the app elsewhere and feeding
-  sub 0 then records silence that looks exactly like a broken app.
-- **The app believes the VM.** `available_usb_captures()` only lists cards
-  whose *driver* field reads `USB-Audio` — a kernel string no module parameter
-  produces — so `lib/guest/asound_overlay.sh` bind-mounts a rewritten
-  `/proc/asound/cards` into the chroot describing card `USBAudio` truthfully
-  as a USB card (everything else in the file stays real). And before
-  recording, `configure_builtin_mic()` shells `amixer` for three Allwinner
-  codec controls that don't exist here, so `/usr/local/bin/amixer` is a shim
-  (`lib/guest/brick_amixer.sh`) that answers exactly those elements — boost
-  ON included — and forwards everything else to the real binary untouched.
+**Output is automatic.** `knulli-vm start` brings the sound pipe up *before* the
+app (an app whose output nobody drains will underrun and can stop reacting to
+input). If you hear nothing: `./knulli-vm audio status`, then
+`./knulli-vm audio start`.
 
-macOS gates both sources behind TCC: `mic` needs **Microphone**, `system`
-needs **Screen Recording**, granted to the *terminal running knulli-vm*, not
-to the binary — a denial kills the feed in its first second and `feed` prints
-the fix rather than reporting a silently-dead pipe. One honest caveat on
-`--source system`: it captures everything the Mac plays, *including*
-`audioplay` rendering the guest's own output, so the app can hear itself
-re-amped; `--source mic` avoids that. For wiring checks without the app,
-`audio_feed.sh usb --tone` (guest side) puts a known sweep straight onto a
-capture device.
-
-## Remapping inputs
-
-Both input paths feed one vocabulary — the `retrogame_joypad` FIFO's button
-names (`A B X Y L1 R1 L2 R2 SELECT START MODE TAB- TAB+`) and hat directions
-(`up down left right`, diagonals spelled `upleft` etc.) — so remapping is
-always "edit one small dict, restart its mapper".
-
-**Keyboard (VNC window)** — the map lives in `lib/guest/keymapd.py`,
-dict `KEYMAP`: keysym → `("btn", NAME)` or `("hat", DIR)` (default table
-above, mirroring the Brick panel; two keys can share a button, like
-`u`/`x` → X). Apply edits with:
+**Recording into the app** is opt-in, because macOS asks permission for it:
 
 ```sh
-./knulli-vm sync && ./knulli-vm keymap restart   # redeploy guest scripts, restart mapper
-./knulli-vm keymap log                           # logs every mapped key press it sees
+./knulli-vm feed mic     # the Mac's MICROPHONE  -> the app's BUILT-IN MIC
+./knulli-vm feed usb     # what the Mac is PLAYING -> the app's USB AUDIO input
+./knulli-vm feed status  # knulli-vm feed stop [usb|mic|all]
 ```
 
-If the app misses quick taps, raise `BTN_HOLD`/`HAT_HOLD` in the same file
-(the 120/220 ms floors are measured against GrainBrick: its buttons are
-event-driven and catch 80 ms taps, but it debounces hat steps under
-~200 ms). A held key machine-gunning instead of repeating means the floors
-are *too short* against your VNC's auto-repeat.
+Three things to know:
 
-**Physical pad (`knulli-vm bridge`)** — the map lives in
-`lib/host/pad_bridge.py`, dicts `BUTTON_MAP` (pygame button index → name)
-and `DPAD_BUTTONS` (index → direction; dpad arrives as buttons on some
-pads). The shipped values were measured on a specific pad and are correct
-for Xbox-order pads only by coincidence — **never copy an assumed standard
-order, sweep your own pad once:**
+1. **Grant the permission to your terminal app**, not to a binary — System
+   Settings → Privacy & Security → **Microphone** (for `mic`) and → **Screen
+   Recording** (for `usb`). The first `feed` fails with the exact fix printed if
+   it's missing; after ticking Screen Recording you must relaunch the terminal.
+2. **Start the feed first, then press record in the app.** A feed whose stream
+   is parked is normal, not hung — it flows the moment the app opens the input.
+3. `feed usb` captures *everything* the Mac plays, including the app's own
+   output coming back out of the Mac's speakers, so you can hear yourself
+   re-amped. `feed usb --source mic` avoids that.
+
+Both feeds can run at once; the app's own source toggle picks which one it
+records.
+
+## Apps
 
 ```sh
-./padenv/bin/python -I - <<'PY'   # press every button/stick once; prints changes
-import os, time; os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
-import pygame; pygame.display.init(); pygame.joystick.init()
-while pygame.joystick.get_count() == 0: pygame.event.pump(); time.sleep(0.1)
-j = pygame.joystick.Joystick(0)
-pb, pa = [0]*j.get_numbuttons(), [0.0]*j.get_numaxes()
-print(f"{j.get_name()!r}: {j.get_numbuttons()} btn {j.get_numaxes()} ax {j.get_numhats()} hat", flush=True)
-while True:
-    pygame.event.pump()
-    for b in range(j.get_numbuttons()):
-        v = j.get_button(b)
-        if v != pb[b]: print(f"BUTTON {b} {'down' if v else 'up'}", flush=True); pb[b] = v
-    for a in range(j.get_numaxes()):
-        v = j.get_axis(a)
-        if (v > 0.4) != (pa[a] > 0.4) or (v < -0.4) != (pa[a] < -0.4):
-            print(f"AXIS {a} {v:+.2f}", flush=True); pa[a] = v
-    time.sleep(0.02)
-PY
+./knulli-vm app add <zip|dir|url> [--name N] [--cmd C] [--default]
+./knulli-vm app list
+./knulli-vm app default NAME      # what bare `start` launches
+./knulli-vm app rm NAME
 ```
 
-Press dpad directions (including diagonals), every button, both sticks.
-Two tells beat guessing when reading the log: an analog trigger moves its
-axis *together with* its digital button (that is how L2/R2 were pinned on
-this pad — buttons 13/16 dragged axes 2/5), and dpad diagonals fire as
-*pairs* of buttons, which proves the four dpad indices even when the
-direction labels are in question. Pads spoofing Microsoft's `045E:028E`
-are the cautionary case: they may enumerate 17 buttons / 6 axes / 0 hats
-in their own raw order, dpad-as-buttons included. Edit the dicts, then
-just rerun `./knulli-vm bridge` — it runs on the Mac, no `sync` needed.
-Pads with no dpad at all fall back to left-stick axes 0/1 automatically.
+An app is installed the way the device would install it, including the vendor's
+own spelling of its directory (`ports/grainbrick beta 1.0.1/` plus its sibling
+`GrainBrick beta 1.0.1.sh`, spaces and all) and running that launcher stub
+rather than guessing an entry point — the stub is what creates and seeds the
+app's `samples/`, `projects/` and `recordings/`, so skipping it would leave you
+with an empty sample browser the device would never show. Only if a ZIP ships no
+stub does knulli-vm look for `gb_launch.py` / `main.py` / `run.sh` / a lone
+`*.sh`; override with `--cmd`.
 
-## Layout
+Re-adding the same app name **upgrades it in place** and preserves your
+`samples/`, `recordings/`, `projects/` and `*.json` settings inside the app dir —
+the same promise the app's own README makes for device upgrades.
+
+## Remapping (optional)
+
+Both input paths speak one vocabulary — button names `A B X Y L1 R1 L2 R2 SELECT
+START MODE TAB- TAB+` and hat directions `up down left right upleft …` — so
+remapping is always "edit one small dict, restart its mapper".
+
+- **Keyboard:** `lib/guest/keymapd.py`, dict `KEYMAP` (two keys may share a
+  button, like `u`/`x` → X). Apply with `./knulli-vm sync && ./knulli-vm keymap
+  restart`. If the app misses quick taps, raise `BTN_HOLD`/`HAT_HOLD` in the
+  same file (shipped: 120 ms buttons / 220 ms dpad, measured against GrainBrick).
+- **Physical pad:** `lib/host/pad_bridge.py`, dicts `BUTTON_MAP` and
+  `DPAD_BUTTONS`. The shipped values were measured on one specific pad and match
+  the "standard" order only by coincidence, so sweep your own pad once — press
+  every button, both sticks, every dpad direction, and read the indices it
+  prints (the `padenv` venv appears the first time you run `bridge`):
+
+  ```sh
+  ./padenv/bin/python -I - <<'PY'
+  import os, time; os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+  import pygame; pygame.display.init(); pygame.joystick.init()
+  while pygame.joystick.get_count() == 0: pygame.event.pump(); time.sleep(0.1)
+  j = pygame.joystick.Joystick(0)
+  pb, pa = [0]*j.get_numbuttons(), [0.0]*j.get_numaxes()
+  print(f"{j.get_name()!r}: {j.get_numbuttons()} btn {j.get_numaxes()} ax {j.get_numhats()} hat", flush=True)
+  while True:
+      pygame.event.pump()
+      for b in range(j.get_numbuttons()):
+          v = j.get_button(b)
+          if v != pb[b]: print(f"BUTTON {b} {'down' if v else 'up'}", flush=True); pb[b] = v
+      for a in range(j.get_numaxes()):
+          v = j.get_axis(a)
+          if (v > 0.4) != (pa[a] > 0.4) or (v < -0.4) != (pa[a] < -0.4):
+              print(f"AXIS {a} {v:+.2f}", flush=True); pa[a] = v
+      time.sleep(0.02)
+  PY
+  ```
+
+  Two tells help you read that log: an analog trigger moves an *axis* together
+  with its *button*, and dpad diagonals fire as *pairs* of buttons — which proves
+  which four indices are the dpad. Pads spoofing Microsoft's `045E:028E` often
+  enumerate in their own raw order with the dpad arriving as buttons. Edit the
+  dicts and just rerun `./knulli-vm bridge` — it runs on the Mac, no `sync`
+  needed. Pads with no dpad fall back to left-stick axes automatically.
+
+## Files on disk
 
 ```
-install.sh              one-shot installer (image/VM/rootfs/SDL/audio/apps)
-knulli-vm               day-to-day CLI (start/stop/app/input/bridge/audio/...)
+install.sh              one-shot installer
+knulli-vm               day-to-day CLI
 vm/knulli.yaml          Lima template (Ubuntu 24.04 arm64, vz)
-lib/guest/              deployed into guest ~/knulli-vm: chroot entry, virtual
-                        joypad, keymapd (keyboard->pad), focusd, launcher,
-                        audio cards + both cable directions (setup_audio,
-                        audio_capture, audio_feed, asound_overlay,
-                        brick_amixer), knulli-image extractor, SDL2 x11 builder
-tools/                  self-tests: audio_static_mix_test (dmix -> the one Mac
-                        cable), input_selftest, keymap_selftest
-lib/host/pad_bridge.py  macOS gamepad bridge
-lib/host/audioplay.swift CoreAudio sink for guest audio (built to bin/)
-lib/host/audiocap.swift  CoreAudio source for guest recording (built to bin/)
-state/                  per-VM config + app registry (gitignored, holds VNC pass)
+lib/guest/              scripts deployed into the VM (chroot entry, virtual
+                        joypad, keyboard mapper, launcher, audio setup, both
+                        audio directions, image extractor, SDL2 builder)
+lib/host/               pad_bridge.py, audioplay.swift, audiocap.swift
+tools/                  self-tests (audio mixer, input, keymap)
+state/                  this install's config + app registry (gitignored;
+                        contains the VNC password)
 downloads/              images, SDL tarballs, app zips (gitignored)
-bin/                    built host binaries (gitignored)
+bin/                    built Mac audio bridges (gitignored)
+padenv/                 venv for gamepad reading (gitignored)
 ```
+
+The VM itself lives in `~/.lima/<vm-name>/`; the extracted KNULLI userspace and
+your installed apps live **inside** it, not in this folder.
+
+To remove an install completely:
+
+```sh
+./knulli-vm down
+limactl delete <vm-name>          # the name is in state/default, or: limactl list
+rm -rf state downloads bin padenv
+```
+
+`limactl delete` destroys the VM disk — including any recordings, samples and
+projects you made inside the app. Copy them out first if you want them.
 
 ## Troubleshooting
 
-- **`mountpoint`/`df` hang in the guest (100% sys spin)** — stacked duplicate
-  bind-mounts. The `mountpoint -q` guards in `knulli-chroot.sh` are
-  load-bearing; never remove them. Recovery: `sudo umount -l <path>` in a loop
-  by explicit path.
-- **"Dynamic linking causes SDL downgrade"** — `/opt/sdl2-x11` must hold
-  SDL ≥ 2.32.8; re-run `lib/guest/build_sdl2_x11.sh`.
-- **App stops reacting after restarting the joypad** — recreating the uinput
-  device requires restarting the app (SDL delivers events only for opened
-  joysticks): `knulli-vm stop && knulli-vm start`.
-- **App silent, or dies/ignores input a few seconds in** — its ALSA stream
-  underruns because nothing is draining the loopback card. `knulli-vm start`
-  starts the audio pipe *before* the app for exactly this reason; if you
-  killed the pipe mid-session, `knulli-vm audio start` (or restart the app).
-- **"App outputs pure silence" but its own meters animate** — suspect the
-  *capture*, not the app. Ground truth is in the guest:
-  `sudo cat /proc/asound/card2/pcm0p/sub*/status` — under the static dmix
-  wiring there is exactly **one** sub in `state: RUNNING` and its `hw_ptr` must
-  advance in real time (`state: RUNNING` alone lies); more than one running
-  playback sub means something bypassed the mixer. The cable is
-  `hw:Loopback,1,0` either way — no sub to hunt for any more. `pgrep -a -x
-  aplay` tells you which flavour you're running: GrainBrick ≤ 1.0 pumps
-  through a child `aplay` (its sub *is* the main output), 1.0.1+ writes ALSA
-  itself and spawns none. A second `gb_launch` process means an orphaned app
-  instance (old builds of `stop` left them; they respawn their aplay when
-  killed) — `knulli-vm stop` now kills the whole tree, clean leftovers with
-  `sudo pkill -f 'gb_launch[.]py'` plus `sudo pkill -x aplay`. A sub in
-  `state: XRUN` produces exactly the pure zeros that get mistaken for a
-  silent app.
-- **Clock healthy, bytes all zero — prove the path before blaming the app.**
-  This entry used to be titled "the app's render loop never engaged", and that
-  conclusion was **wrong**; keep the measurement, drop the verdict. What was
-  recorded on 2026-11-03: GrainBrick 1.0.1's meters said GRAIN STATE ON / ACTIVE
-  GRAINS 2, its audio subprocess fed the pump at exactly 192 kB/s (= 48 kHz
-  stereo 16-bit) while burning ~3% of a core, and both cables read
-  `RMS 0.0 peak 0 nonzero 0.00%` with the UI fully responsive — written up as
-  "the app is writing silence, take it to the app's author". It was the VM: the
-  run-time substream chooser was reading the app's always-on monitor stream,
-  which clocks *digital silence at full rate*, while real audio played on another
-  sub. Static dmix wiring removed the choice, and the same app is audible.
-  So measure, in this order: stop the Mac pipe (`knulli-vm audio stop`), capture
-  the one cable yourself (`sudo arecord -D hw:Loopback,1,0 -f S16_LE -r 48000 -c
-  2 -t raw -q` for a few seconds) and compute RMS/peak/`nonzero%`; then prove the
-  path with a tone you know is loud (`aplay -D default /tmp/sine.wav` in the
-  chroot — a healthy path reads back nonzero RMS and a nonzero-sample share).
-  Only once the path is exonerated *and* the app's stream is the single running
-  sub is a zero-filled capture the app's doing; `audio_process.log` (ending at
-  `AUDIO OUTPUT STARTED: default`) is the companion evidence. Separately: a
-  device that plays one note, then hangs at 100% CPU while the UI keeps answering
-  was seen on real hardware and is still unexplained.
-- **VNC shows the *other* VM's screen** — two installs cannot both own 5901
-  (Lima forwards the guest port to the same port on the Mac, and the second
-  forward never binds). `install.sh` picks a free port for later installs and
-  prints it; `knulli-vm vnc` refuses to advertise a port another VM serves.
-  Fix a stuck install with `./install.sh --vm-name <name> --vnc-port <free>`.
-- **`arecord` says "Device or resource busy"** — an orphaned capture from a
-  previous session holds the loopback: `knulli-vm audio stop` then `start`.
-- **VNC keyboard/mouse laggy by seconds** — this was x11vnc starving its own
-  client input queue while diffing the framebuffer (Recv-Q grew unboundedly
-  under animation). Fixed by serving the display with TigerVNC `Xvnc`
-  (X server + VNC in one) instead of Xvfb+x11vnc; `run_app.sh` prefers it
-  automatically. If you're on the Xvfb fallback (no `Xvnc` binary), input
-  lag is expected.
-- **Keyboard does nothing on the VNC display** — `./knulli-vm keymap restart`
-  first: that's the mapper (`keymapd.py`) being down or deaf, and it's a
-  one-second fix; `./knulli-vm keymap log` then shows every mapped key it
-  receives (if the log scrolls while you type but the app doesn't react,
-  the problem is the joypad/app side, not the keyboard). Still nothing?
-  No window manager exists, so `focusd.sh` (started by the launcher) keeps
-  focus on the app window; check `pgrep -f focusd` and
-  `~/knulli-vm-logs/focusd.log` in the guest. (keymapd is now self-healing — it never blocks its X event
-  thread on the joypad FIFO and reconnects if the X connection dies — but
-  an old-style deaf instance from before that fix needs one restart.)
-- **VNC shows an auth error before the password prompt** — modern macOS
-  Screen Sharing refuses auth-less servers; the launcher starts `Xvnc` with
-  `-SecurityTypes VncAuth -PasswordFile` (x11vnc fallback: `-passwd`).
-- **`pkill -f <pattern>` from a shell whose cmdline contains the pattern kills
-  your own ssh session** — use `pattern[.]ext`.
-- **Copies from host paths land double-nested (`dst/name/name/`)** — on
-  Lima's virtiofs mount `cp -a path/ dest/` (trailing slash) copies the
-  directory *itself*, not its contents; use the `path/.` form. This bit the
-  app installer repeatedly before it was diagnosed.
-- `limactl start` may stall on lima's optional containerd step; the VM is
-  usable regardless — `limactl shell <vm>`.
+- **No sound.** `./knulli-vm audio status`, then `audio start`. If `install.sh`
+  printed `no swiftc`, install the Xcode Command Line Tools and re-run it — the
+  Mac-side audio player is built from Swift.
+- **The app dies or stops reacting to input a few seconds in.** Its audio
+  underruns when nothing drains it. `./knulli-vm audio start`, or restart the app.
+- **Keyboard does nothing on the VNC screen.** `./knulli-vm keymap restart`
+  first — that is the mapper, and it's a one-second fix. Then `keymap log`: if it
+  scrolls while you type but the app ignores you, the problem is the app/pad side.
+- **App ignores input after you restarted the joypad.** Recreating the emulated
+  pad requires restarting the app: `./knulli-vm stop && ./knulli-vm start`.
+- **VNC shows a different VM's screen.** Two installs collided on port 5901.
+  Re-run `./install.sh --vm-name <name> --vnc-port <free>` for the stuck one.
+- **"Device or resource busy" from arecord.** A capture from a previous session
+  still holds the loopback: `./knulli-vm audio stop` then `start`.
+- **"Dynamic linking causes SDL downgrade".** The X11 SDL build must be
+  ≥ 2.32.8; re-run `./install.sh`, which rebuilds it.
+- **VNC gives an auth error before asking for a password.** macOS Screen Sharing
+  refuses servers with no auth; the launcher starts TigerVNC with VNC auth, so
+  this means you're on a fallback path — `./knulli-vm status` shows which server
+  is serving the display.
+- **Input lags by whole seconds.** That is the Xvfb+x11vnc fallback starving its
+  own input queue. `install.sh` installs TigerVNC, which serves display and VNC
+  as one server and doesn't have the problem; make sure it succeeded.
+- **`limactl start` stalls on a containerd step.** It's optional; the VM is
+  usable anyway — `limactl shell <vm-name>`.
 
-## Status / known limits
+## Notes
 
-- Video: TigerVNC `Xvnc` serves 1280×720 directly on the install's VNC port
-  (5901, or the next free one — `knulli-vm status` says which; Xvfb+x11vnc
-  only as fallback). Audio out: the VM path works — loopback → Mac speakers,
-  48 kHz stereo, verified end to end by playing a tone through the chroot's
-  `default` and measuring it back on the Mac. Which aloop sub carries the
-  app's main output is discovered per run (see **Audio**), so nothing here
-  assumes the app pumps through `aplay`. If a *specific app version* renders
-  silence, that's the app; the troubleshooting bullet above shows how to tell
-  the two apart in five commands. Mic/USB in: the mirror path exists —
-  `knulli-vm feed mic|usb` pipes the Mac's microphone / system audio into the
-  faked `Codec`/`USBAudio` cards (see **Recording**), so the app records real
-  signal instead of a silent loopback. End-to-end capture through the app is
-  verified by hand, run by run (permission dialogs make it a human step).
-- Apps run as root in the chroot (knulli's own model); the VM is the sandbox —
-  treat downloaded images/apps as untrusted accordingly.
+- Where these numbers come from, why the audio path is wired the way it is, the
+  measurement recipes, and the traps that cost hours are written up in maintainer
+  notes (`INTERNALS.md`), which are deliberately kept out of git — ask the
+  maintainer if you're changing the tooling and want them.
+- KNULLI: <https://knulli.org> · images:
+  <https://github.com/knulli-cfw/distribution/releases> · TrimUI hardware:
+  <https://www.trimui.com>.

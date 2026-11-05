@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 .DS_Store
 bin/
+# Maintainer notes (architecture rationale, measurement history, traps) stay
+# local by request — the README is the only doc that ships.
+INTERNALS.md
