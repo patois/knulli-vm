@@ -325,7 +325,9 @@ echo
 echo "knulli-vm ready."
 if [ -d "$STATE/$VM.apps" ] && [ -n "$(ls -A "$STATE/$VM.apps" 2>/dev/null)" ]; then
     echo "  ./knulli-vm start          # launch the default app (+ audio to Mac)"
-    echo "  open \$(./knulli-vm vnc)   # VNC in (password: $VNC_PASS)"
+    # the URL, not `open $(./knulli-vm vnc)`: that command prints
+    # "vnc://localhost:PORT  (password: ...)" and `open` choked on the rest
+    echo "  open vnc://localhost:$VNC_PORT   # VNC in (password: $VNC_PASS)"
     echo "  keyboard on the VNC screen maps to the Brick's buttons:"
     echo "  WASD/arrows=dpad  j=A k=B u/x=X i=Y  q/e=L1/R1  z/c=L2/R2"
     echo "  Enter=Start  BackSpace=Select  m=Menu  F1/F2=tabs"
