@@ -290,23 +290,29 @@ CONF="$STATE/$VM.conf"
 echo "$VM" > "$STATE/default"
 say "config: $CONF"
 
-# ---- 7. host audio player ---------------------------------------------------
-# Guest has no sound hardware; `knulli-vm audio` streams the loopback card
-# over ssh into this CoreAudio sink (built with the Xcode CLT compiler).
+# ---- 7. host audio bridges ----------------------------------------------------
+# Guest has no sound hardware. audioplay is the OUTPUT sink (`knulli-vm audio`:
+# loopback -> ssh -> Mac speakers); audiocap is the INPUT source (`knulli-vm
+# feed`: Mac mic / Mac system audio -> ssh -> the app's capture cards). Both
+# are built with the Xcode CLT compiler.
 # rebuild when stale too, not just when absent: an install from before the
 # AVAudioEngine rewrite would otherwise keep running the old AudioQueue
 # binary — which rendered nothing — through every later re-run.
-if [ ! -x "$HERE/bin/audioplay" ] || \
-   [ "$HERE/lib/host/audioplay.swift" -nt "$HERE/bin/audioplay" ]; then
-    if command -v xcrun >/dev/null && xcrun --find swiftc >/dev/null 2>&1; then
-        say "building host audio player (bin/audioplay)"
-        mkdir -p "$HERE/bin"
-        xcrun swiftc -O -o "$HERE/bin/audioplay" "$HERE/lib/host/audioplay.swift" & hp=$!
-        heartbeat "swiftc" $hp
-        wait $hp || say "WARNING: audioplay build failed — guest audio will be silent"
-    else
-        say "WARNING: no swiftc (xcode-select --install) — guest audio will be silent"
-    fi
+if command -v xcrun >/dev/null && xcrun --find swiftc >/dev/null 2>&1; then
+    mkdir -p "$HERE/bin"
+    for b in "audioplay:guest audio out will be silent" \
+             "audiocap:the app will have no mic or USB input (knulli-vm feed)"; do
+        name=${b%%:*}; consequence=${b#*:}
+        if [ ! -x "$HERE/bin/$name" ] || \
+           [ "$HERE/lib/host/$name.swift" -nt "$HERE/bin/$name" ]; then
+            say "building host audio bridge (bin/$name)"
+            xcrun swiftc -O -o "$HERE/bin/$name" "$HERE/lib/host/$name.swift" & hp=$!
+            heartbeat "swiftc $name" $hp
+            wait $hp || say "WARNING: $name build failed — $consequence"
+        fi
+    done
+else
+    say "WARNING: no swiftc (xcode-select --install) — guest audio will be silent and feed unavailable"
 fi
 
 # ---- 8. apps --------------------------------------------------------------------

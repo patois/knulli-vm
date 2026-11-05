@@ -174,31 +174,120 @@ dpad steps** (measured against GrainBrick: its buttons are event-driven and
 catch 80 ms taps, but it debounces hat steps under ~200 ms) — and keyboard
 auto-repeat is absorbed as a single held key.
 
-**Audio.** The guest has no sound device, so the chroot's ALSA `default` is
-routed into a `snd-aloop` loopback card (`lib/guest/setup_audio.sh`) and
-`knulli-vm audio start` (run automatically by `start`) captures the far end
-over ssh into `bin/audioplay`, a tiny CoreAudio sink on the Mac. Three details
-that look wrong but are right: the aloop cables are *cross-wired* (default
-writes device 0 playback → host reads device 1 capture); `snd-dummy` occupies
-card 0 on purpose because apps like GrainBrick open the mic as a hardcoded
-`hw:1,0` — card 1 must be the loopback card; and the capture *subdevice* is
-discovered at run time by `lib/guest/audio_capture.sh`, never hardcoded —
-snd-aloop hands out one substream per opened stream (cable N = playback subN
-→ capture subN), and GrainBrick opens several (its UI/SDL preview stream,
-plus the `aplay` its audio pump spawns — or, in 1.0.1+, no `aplay` at all
-because the app writes ALSA itself). So the script does not ask *who owns* a
-stream, it asks **which cable carries motion**: the playback sub whose
-`hw_ptr` actually advances is the one to capture, with the `aplay`-owned sub
-winning when one exists and a short grace period first so the preview stream
-can't win the race. Hardcoding sub0 once meant hours of "the app outputs pure
-silence" while an orphaned app instance held sub0 in XRUN and real audio
-flowed on sub3, unseen; an `aplay`-only search does the same thing to an app
-that owns its stream (it finds nothing, gives up, and the app then sits
-underrunning — which also costs input responsiveness). Latency is tuned for
-playability: `arecord -B 100000 -F 25000` (100 ms buffer / 25 ms periods) and
-25 ms CoreAudio chunks in `audioplay`, end-to-end ≈ 80–100 ms behind the VM.
-(The 100 ms buffer is also what keeps an app that owns its own ALSA stream —
-no `aplay` child — from underrunning while you read the cable.)
+**Audio.** The guest has no sound device, so the whole sound system is
+`snd-aloop` loopback cards — three of them, indices pinned by
+`lib/guest/setup_audio.sh` because every number is load-bearing: **card 0
+`Codec`** stands in for the device's built-in codec (GrainBrick's BUILT-IN MIC
+preset is a hardcoded `hw:0,0`), **card 1 `USBAudio`** is the emulated USB
+interface the app records from (GrainBrick 1.0 hardcodes `hw:1,0`, 1.0.1+
+resolves it by name — index 1 under both spellings serves every build), and
+**card 2 `Loopback`** is the app's output path. `snd-dummy` used to occupy
+card 0; it can only ever hand a capture path silence, and its claim on index 0
+makes aloop refuse to probe at all (`cannot find the slot for index 0,
+error: -16`). Each card is created with **two PCM devices** (`pcms=2,2,2`)
+because the aloop cables are *cross-wired* — device 0 playback ↔ device 1
+capture, same substream number, while same-numbered pairs carry nothing — so a
+one-device card has no far end for its cable at all.
+
+For **output**: the chroot's ALSA `default` **mixes** every playback client
+through `dmix` onto ONE aloop substream, and `knulli-vm audio start` (run
+automatically by `start`) captures the far end — `hw:Loopback,1,0` — over ssh
+into `bin/audioplay`, a tiny CoreAudio sink on the Mac. One cable, fixed for the
+life of the card: nothing is discovered, chosen or re-chosen while music is
+playing. `tools/audio_static_mix_test.sh` is the proof — two clients through
+`default`, both caught mixed on that one cable, with the app holding its
+always-on monitor stream.
+
+Why a mixer instead of picking a substream: snd-aloop hands out one substream
+per opened stream (cable N = playback subN → capture subN), and GrainBrick opens
+several — an always-on monitor/live-mix stream plus the `aplay` its audio pump
+spawns — so a capture pinned to one of them hears only that one. Hardcoding sub0
+once meant hours of "the app outputs pure silence" while an orphaned app
+instance held sub0 in XRUN and real audio flowed on sub3, unseen.
+
+Choosing at run time was the intermediate step, and it was worse. The app's
+monitor stream clocks *digital silence at full rate* (`hw_ptr` climbing 48000
+frames/s, peak 1), so a chooser that picks by motion wires the Mac to silence
+whenever the app is idle at pipe-start — the ordinary case, since `start` brings
+the pipe up before anyone presses play. A chooser that re-measures *content*
+while streaming does find the right cable, but it charges for the looking:
+probing means briefly not draining the stream you hold, and switching means
+reopening the cable, so the note you are playing gets a gap and a crackle in the
+middle of it. `dmix` removes the question instead of answering it faster — every
+client shares one hardware substream, so there is exactly one cable to read and
+it exists the moment the card does. `plug` in front converts whatever a client
+asks for (mono, 44.1 kHz) into that mix, and `default` is an `asym` pair because
+dmix is playback-only: capture stays device 0's capture, the cable nothing
+writes, so `arecord -D default` still opens and an idle mic reads silence
+instead of being echoed the app's own output.
+
+**Where the latency actually is.** Everything scheduled on an
+`AVAudioPlayerNode` renders *later*, so the depth of that queue **is** the delay
+you hear — and `audioplay` used to schedule every buffer immediately and throttle
+only above 250 ms. The guest produces at exactly realtime, so the queue filled to
+~250-300 ms and **never drained**: measured median 297 ms, dead flat from
+t = 0.5 s to 7.5 s, and every hiccup added delay that was never returned. A
+policy that only ever waits can get slower forever and never faster.
+
+`audioplay` now holds the queue at two chunks and reports its own depth —
+`AUDIOPLAY_DEBUG=1` prints schedule→render completion twice a second on stderr
+(measured, not inferred from a counter; and on stderr because stdout is
+block-buffered when redirected, which silently ate a whole measurement). On the
+live path that is **~52 ms**, flat over 9.5 s, versus 297 ms before. The rest of
+the chain is the dmix ring (21 ms periods / 85 ms buffer), `arecord -B 100000
+-F 25000`, and 25 ms chunks; if it still feels late, shrink the dmix ring next —
+but it belongs to whichever client opens the mixer first (the app's monitor
+stream), so a new size only takes effect when the app restarts.
+
+**Recording (host → guest).** GrainBrick records from two sources and lets you
+toggle between them in the app: the **BUILT-IN MIC** (`hw:0,0`, 48 kHz mono)
+and a **USB AUDIO** device (`plughw:CARD=USBAudio,DEV=0`, 48 kHz stereo). The
+VM fakes both capture devices; what makes them *real* is `knulli-vm feed`:
+
+```sh
+./knulli-vm feed usb      # what the Mac is PLAYING  -> the app's USB source
+./knulli-vm feed mic      # the Mac's MICROPHONE     -> the app's BUILT-IN MIC
+./knulli-vm feed status          # feed stop [usb|mic|all]; --source overrides
+```
+
+The defaults *are* the design: the app's "USB" input is the host's own audio,
+never a USB device passed through — `lib/host/audiocap.swift` reads the Mac
+through CoreAudio only (AVAudioEngine's input node for `mic`, ScreenCaptureKit
+for `system`), and the bytes travel down an ssh pipe into
+`lib/guest/audio_feed.sh`, which writes the *playback* end of the cross-cable
+the app's `arecord` holds. Both feeds run at the same time; the app's
+source toggle simply picks which cable it is reading. Three things the path
+handles so it doesn't lie:
+
+- **Format match before bytes.** The feed first asks `audio_feed.sh --probe`
+  for the app's live capture `hw_params` (rate/channels/sub) and sizes
+  `audiocap`'s output to them — the two ends of an aloop cable share ONE ring
+  buffer, so a rate mismatch is a pitch shift, not an error. Nothing
+  recording yet? The feed uses the app's own preset (48 k stereo / mono) and
+  feeds sub 0, which the app will then be handed when it opens.
+- **Sub discovery, same rule as output.** ALSA hands out the next free
+  substream, so `--sub` is matched to the app's open stream when there is one
+  and never hardcoded; a leftover holder shifts the app elsewhere and feeding
+  sub 0 then records silence that looks exactly like a broken app.
+- **The app believes the VM.** `available_usb_captures()` only lists cards
+  whose *driver* field reads `USB-Audio` — a kernel string no module parameter
+  produces — so `lib/guest/asound_overlay.sh` bind-mounts a rewritten
+  `/proc/asound/cards` into the chroot describing card `USBAudio` truthfully
+  as a USB card (everything else in the file stays real). And before
+  recording, `configure_builtin_mic()` shells `amixer` for three Allwinner
+  codec controls that don't exist here, so `/usr/local/bin/amixer` is a shim
+  (`lib/guest/brick_amixer.sh`) that answers exactly those elements — boost
+  ON included — and forwards everything else to the real binary untouched.
+
+macOS gates both sources behind TCC: `mic` needs **Microphone**, `system`
+needs **Screen Recording**, granted to the *terminal running knulli-vm*, not
+to the binary — a denial kills the feed in its first second and `feed` prints
+the fix rather than reporting a silently-dead pipe. One honest caveat on
+`--source system`: it captures everything the Mac plays, *including*
+`audioplay` rendering the guest's own output, so the app can hear itself
+re-amped; `--source mic` avoids that. For wiring checks without the app,
+`audio_feed.sh usb --tone` (guest side) puts a known sweep straight onto a
+capture device.
 
 ## Remapping inputs
 
@@ -270,9 +359,14 @@ knulli-vm               day-to-day CLI (start/stop/app/input/bridge/audio/...)
 vm/knulli.yaml          Lima template (Ubuntu 24.04 arm64, vz)
 lib/guest/              deployed into guest ~/knulli-vm: chroot entry, virtual
                         joypad, keymapd (keyboard->pad), focusd, launcher,
-                        audio routing, knulli-image extractor, SDL2 x11 builder
+                        audio cards + both cable directions (setup_audio,
+                        audio_capture, audio_feed, asound_overlay,
+                        brick_amixer), knulli-image extractor, SDL2 x11 builder
+tools/                  self-tests: audio_static_mix_test (dmix -> the one Mac
+                        cable), input_selftest, keymap_selftest
 lib/host/pad_bridge.py  macOS gamepad bridge
 lib/host/audioplay.swift CoreAudio sink for guest audio (built to bin/)
+lib/host/audiocap.swift  CoreAudio source for guest recording (built to bin/)
 state/                  per-VM config + app registry (gitignored, holds VNC pass)
 downloads/              images, SDL tarballs, app zips (gitignored)
 bin/                    built host binaries (gitignored)
@@ -369,9 +463,10 @@ bin/                    built host binaries (gitignored)
   app's main output is discovered per run (see **Audio**), so nothing here
   assumes the app pumps through `aplay`. If a *specific app version* renders
   silence, that's the app; the troubleshooting bullet above shows how to tell
-  the two apart in five commands. Mic in: apps open `hw:1,0` and get a
-  *silent* loopback capture — there is no host-mic→guest pipe yet (would be
-  the mirror of the playback path; `snd-aloop`'s free cross-cable is already
-  there for it).
+  the two apart in five commands. Mic/USB in: the mirror path exists —
+  `knulli-vm feed mic|usb` pipes the Mac's microphone / system audio into the
+  faked `Codec`/`USBAudio` cards (see **Recording**), so the app records real
+  signal instead of a silent loopback. End-to-end capture through the app is
+  verified by hand, run by run (permission dialogs make it a human step).
 - Apps run as root in the chroot (knulli's own model); the VM is the sandbox —
   treat downloaded images/apps as untrusted accordingly.

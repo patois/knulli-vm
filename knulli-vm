@@ -318,6 +318,20 @@ cmd_start() {
 
 cmd_stop() {
     cmd_audio stop
+    # feeds are opt-in, but leaving audiocap + a guest aplay holding a
+    # loopback substream after the app dies is the orphan class that has
+    # faked "silent app" before — sweep them with the app.
+    # SAY WHICH ONES. A feed that vanishes without a word is indistinguishable
+    # from a broken capture path: "microphone recording does not work at all"
+    # turned out to be an app restart that had swept the feed, and nothing on
+    # screen said so. Auto-relaunching on `start` is deliberately NOT the fix —
+    # a 'system' feed re-captures the guest's own output (feedback), and macOS
+    # capture permissions are a human decision — so report and let the user
+    # decide.
+    local swept
+    swept=$(cmd_feed status 2>/dev/null | awk -F': ' '/: running/ {gsub(/^ +/, "", $1); printf "%s ", $1}')
+    cmd_feed stop all >/dev/null 2>&1 || true
+    [ -n "$swept" ] && echo "  feeds stopped with the app (${swept% }) — bring them back with: knulli-vm feed mic  /  knulli-vm feed usb"
     # Kill the WHOLE tree, not just the wrapper pid: the app UI, its
     # audio-pump child and aplay survive a wrapper-only kill as ppid=1
     # orphans that keep hogging X, an aloop substream and CPU — and an
@@ -354,6 +368,7 @@ cmd_status() {
     # root process — status then cries "not running" while the app plays.
     printf "  app:     "; p=$(cat /tmp/knulli-app.pid 2>/dev/null); [ -n "$p" ] && ps -p "$p" -o pid= >/dev/null 2>&1 && echo "running (pid $p)" || echo not running'
     printf "  audio:   "; audio_running >/dev/null && echo "streaming to Mac (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming"
+    (cmd_feed status) | sed 's/^  feed /  feed   /'
     echo "  apps:"; (cmd_app list) | sed 's/^/    /'
 }
 
@@ -471,17 +486,22 @@ cmd_audio() {
                 xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
                     || die "audioplay build failed (need xcrun swiftc: xcode-select --install)"
             fi
-            # audio_capture.sh (guest, as root) discovers WHICH aloop
-            # substream the app's aplay owns and captures that cable —
-            # a hardcoded subdevice captures whatever stale stream last
-            # held it (an orphaned app instance once made real audio
-            # look like pure silence for hours). -B/-F are microseconds:
-            # 100 ms buffer / 25 ms periods keeps the loopback->ssh pipe
-            # flowing in small quanta (low latency) while staying far
-            # above the app's ~21 ms DSP blocks (no xruns).
+            # audio_capture.sh (guest, as root) reads ONE fixed cable: the
+            # chroot's default mixes every playback client through dmix onto a
+            # single aloop substream (setup_audio.sh), so there is nothing to
+            # discover and nothing to re-select mid-note. An earlier version
+            # picked a substream at run time and then followed the audio; with
+            # the app's always-on silent monitor stream that meant the Mac could
+            # be wired to silence while real audio played elsewhere, and the
+            # follow itself put a gap in the middle of playback.
+            # -B/-F are microseconds: 100 ms buffer / 25 ms periods keeps the
+            # loopback->ssh pipe flowing in small quanta (low latency) while
+            # staying far above the app's ~21 ms DSP blocks (no xruns).
+            # stderr is appended to a log, never discarded: a pipe that cannot
+            # open its cable otherwise fails as silence.
             # bash -lc on the guest so ~ expands THERE (limactl's exec
             # form spawns no guest shell; host-side $HOME would leak in)
-            nohup bash -c "limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_capture.sh 2>/dev/null' | '$AUDIO_BIN' 48000 2" \
+            nohup bash -c "limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_capture.sh 2>>~/knulli-vm-logs/audio_capture.log' | '$AUDIO_BIN' 48000 2" \
                 >/dev/null 2>&1 &
             echo $! > "$AUDIO_PIDF"
             echo "audio: guest loopback -> Mac speakers (pid $!)"
@@ -489,12 +509,144 @@ cmd_audio() {
         stop)
             if audio_running; then killtree "$(cat "$AUDIO_PIDF")"; fi
             rm -f "$AUDIO_PIDF"
-            # bracket trick: the pattern must not match this very ssh cmdline
-            gexec 'sudo pkill -f "arecord -D hw:Loopback[,].1,0" 2>/dev/null; true'
+            # bracket trick: the pattern must not match this very ssh cmdline.
+            # Any sub, not just ,0: a stale reader anywhere on the card is
+            # invisible from the Mac. The .py pattern exists only to clear a
+            # follower process left running from before the cable was fixed; it
+            # respawned its own arecord, so it had to die too.
+            gexec 'sudo pkill -f "audio_capture[.]py" 2>/dev/null; sudo pkill -f "arecord -D hw:Loopback[,].1," 2>/dev/null; true'
             ;;
         status)
             audio_running && echo "streaming (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming";;
         *) die "audio: start|stop|status";;
+    esac
+}
+
+# ---- host audio -> guest capture (the app's USB input and built-in mic) ------
+# The input mirror of cmd_audio. The VM now fakes the two capture devices
+# GrainBrick records from (setup_audio.sh builds the cards, asound_overlay.sh
+# describes the USB one to the app); neither has hardware, so audiocap reads
+# the Mac's OWN audio — the microphone (AVAudioEngine) or what the Mac is
+# playing (ScreenCaptureKit) — and the bytes travel down the same ssh-pipe
+# style as the playback path into audio_feed.sh, which writes the cross-device
+# loopback cable the app's arecord is holding. No host USB device is ever
+# passed through: the app's "USB AUDIO" input is the host's audio, by design.
+#
+#   knulli-vm feed usb            Mac system audio -> app's USB source
+#   knulli-vm feed mic            Mac microphone   -> app's BUILT-IN MIC
+#   knulli-vm feed usb|mic --source mic|system [--secs N]
+#   knulli-vm feed stop [usb|mic|all]  |  knulli-vm feed status
+FEED_BIN="$HERE/bin/audiocap"
+feed_pidf() { echo "$STATE/feed.$VM.$1.pid"; }
+feed_logf() { echo "$STATE/feed.$VM.$1.log"; }
+feed_running() {
+    local p; p=$(cat "$(feed_pidf "$1")" 2>/dev/null) || return 1
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+cmd_feed() {
+    local what="${1:-status}"; shift || true
+    case "$what" in
+        usb|mic)
+            local target="$what" source="" secs=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --source) source="$2"; shift 2;;
+                    --secs)   secs="$2"; shift 2;;
+                    *) die "feed $target: unknown flag $1";;
+                esac
+            done
+            # The defaults ARE the feature: the app's USB input hears the
+            # Mac's audio, the app's mic hears the Mac's microphone.
+            [ -n "$source" ] || { [ "$target" = usb ] && source=system || source=mic; }
+            case "$source" in mic|system) ;; *) die "feed: --source must be mic or system";; esac
+            if feed_running "$target"; then
+                echo "feed $target: already running (pid $(cat "$(feed_pidf "$target")")) — knulli-vm feed stop $target first"
+                return
+            fi
+            if [ ! -x "$FEED_BIN" ] || [ "$HERE/lib/host/audiocap.swift" -nt "$FEED_BIN" ]; then
+                echo "building host audio capture (swiftc) ..."
+                mkdir -p "$HERE/bin"
+                xcrun swiftc -O -o "$FEED_BIN" "$HERE/lib/host/audiocap.swift" \
+                    || die "audiocap build failed (need xcrun swiftc: xcode-select --install)"
+            fi
+            gexec "test -f ~/knulli-vm/audio_feed.sh" \
+                || die "guest feed injector missing — run: knulli-vm sync"
+
+            # Size the host encoder from the app's ACTUAL capture stream
+            # before any byte flows: the loopback ends share one ring buffer,
+            # so a rate/channel mismatch is a pitch shift, not an error.
+            # "-" = nothing recording yet; feed the app's preset format to
+            # sub 0 and skip the injector's wait (nothing to discover yet —
+            # and audiocap's queue only holds 0.75 s, so waiting blind just
+            # drops the head of the feed).
+            local probe rate ch psub wait=20 subopt=""
+            probe=$(gexec "~/knulli-vm/audio_feed.sh $target --probe 2>/dev/null")
+            read -r rate ch psub <<< "$probe"
+            case "$rate" in ''|*[!0-9]*) rate=48000;; esac
+            case "$ch"  in ''|*[!0-9]*) ch=$([ "$target" = usb ] && echo 2 || echo 1);; esac
+            if [ -z "$psub" ] || [ "$psub" = "-" ]; then wait=0; else subopt="--sub $psub"; fi
+
+            # Re-amp warning: 'system' captures EVERYTHING the Mac plays —
+            # including audioplay rendering the guest's own output, so the app
+            # would hear itself. Excluding it is not possible from this side.
+            if [ "$source" = system ] && audio_running; then
+                echo "feed $target: NOTE — 'system' also re-captures the guest's own audio playing on this Mac (feedback possible); --source mic avoids it"
+            fi
+
+            local logf; logf="$(feed_logf "$target")"
+            # The whole pipeline in one nohup'd bash: audiocap's stdout IS the
+            # ssh stdin. Killing this pid (killtree) closes the pipe; the
+            # guest's aplay then sees EOF and exits, so no orphan holds the
+            # loopback (the ghost class that once faked "silent app" for hours).
+            nohup bash -c "'$FEED_BIN' '$source' '$rate' '$ch' ${secs:+--secs '$secs'} \
+                | limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_feed.sh $target --wait $wait $subopt'" \
+                </dev/null >"$logf" 2>&1 &
+            local pid=$!
+            echo "$pid" > "$(feed_pidf "$target")"
+            # Permission failures (Microphone / Screen Recording) kill it in
+            # the first second with the fix spelled out — surface that now
+            # instead of reporting a feed that is silently dead.
+            sleep 1
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "feed $target: failed to start:"
+                sed 's/^/  /' "$logf" 2>/dev/null | tail -12
+                rm -f "$(feed_pidf "$target")"
+                [ "$source" = mic ] && echo "  (System Settings > Privacy & Security > Microphone — enable your TERMINAL app)"
+                [ "$source" = system ] && echo "  (System Settings > Privacy & Security > Screen Recording — enable your TERMINAL app, then relaunch it)"
+                exit 1
+            fi
+            echo "feed $target: Mac $source -> $target (${rate}Hz/${ch}ch, guest sub ${psub:-0} ${subopt:+matched}${subopt:- blind}, pid $pid)"
+            echo "  log: $logf   stop: knulli-vm feed stop $target"
+            ;;
+        stop)
+            local list t
+            case "${1:-all}" in
+                all) list="usb mic";;
+                usb|mic) list="$1";;
+                *) die "feed stop: usb | mic | all";;
+            esac
+            for t in $list; do
+                feed_running "$t" && killtree "$(cat "$(feed_pidf "$t")")"
+                # keep the log: "the feed died mid-take" is exactly when it matters
+                rm -f "$(feed_pidf "$t")"
+                # belt and braces: an aplay orphaned by a killed ssh still
+                # holds the cable; the bracket trick keeps pkill from
+                # matching this very command line.
+                local card; card=$([ "$t" = usb ] && echo USBAudio || echo Codec)
+                gexec "sudo pkill -f 'audio_feed[.]sh $t' 2>/dev/null; sudo pkill -f 'aplay -D hw:$card,1,' 2>/dev/null; true"
+            done
+            echo "feed: stopped"
+            ;;
+        status)
+            local t
+            for t in usb mic; do
+                printf "  feed %-4s " "$t:"
+                feed_running "$t" \
+                    && echo "running (pid $(cat "$(feed_pidf "$t")"), $(head -c 200 "$(feed_logf "$t")" 2>/dev/null | grep -o 'source=[^ ]*' | head -1))" \
+                    || echo "not running"
+            done;;
+        *) die "feed: usb|mic [--source mic|system] [--secs N] | stop [usb|mic|all] | status";;
     esac
 }
 
@@ -570,6 +722,7 @@ case "${1:-help}" in
     screenshot|shot) shift; cmd_screenshot "$@";;
     bridge) cmd_bridge;;
     audio) shift; cmd_audio "$@";;
+    feed) shift; cmd_feed "$@";;
     app) shift; cmd_app "$@";;
     sync) cmd_sync;;
     help|--help|-h)
@@ -595,6 +748,14 @@ knulli-vm — run apps inside extracted KNULLI userspace in a Lima VM
                                 q/e=L1/R1, z/c=L2/R2, Enter=Start,
                                 BackSpace=Select, m=MENU, F1/F2=tabs)
   knulli-vm audio start|stop    pipe guest audio to the Mac (auto by start)
+  knulli-vm feed usb|mic        host audio -> the app's capture devices
+                                usb  = the app's USB AUDIO input  (Mac's audio)
+                                mic  = the app's BUILT-IN MIC     (Mac's mic)
+                                [--source mic|system] [--secs N]
+                                stop [usb|mic|all] | status
+                                (macOS prompts for Microphone / Screen
+                                Recording the first time; grant to the
+                                TERMINAL running knulli-vm)
   knulli-vm keymap restart      VNC keyboard mapper: restart|status|log
                                 (if WASD/arrows stop mapping on the VNC
                                 screen, this fixes it in one second)
