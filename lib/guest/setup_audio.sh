@@ -110,66 +110,74 @@ if $SUDO test -f "$R/etc/asound.conf" && ! $SUDO grep -q "knulli-vm" "$R/etc/aso
     echo "backed up image asound.conf -> etc/asound.conf.knulli-vm-orig"
 fi
 $SUDO tee "$R/etc/asound.conf" > /dev/null <<'EOF'
-# knulli-vm: send all audio to the loopback card; the Mac host captures
-# hw:Loopback,1,0 (same rate/format) and plays it. Do not edit the rate or
-# format without matching the host-side arecord invocation.
+# knulli-vm: send all audio to the loopback card; the Mac host captures the far
+# end by NAME (audio_capture.sh, same rate/format) and plays it. Do not edit the
+# rate or format without matching that reader.
 # Device choice is load-bearing, and aloop's cable map is NOT what the docs
 # suggest: a matrix measured by RMS (noise on each playback sub x capture on
 # each device/sub, both start orders) proves the cable is CROSS-DEVICE and
 # same-substream — D0p subN -> D1c subN and D1p subN -> D0c subN — while
 # same-numbered pairs carry nothing. (Byte counts cannot show this: arecord
 # returns full-length buffers of zeros from a dead cable.) So: apps write
-# default -> device 0; the Mac reads hw:Loopback,1,0 — that is the live cable.
+# default -> device 0, and the Mac reads device 1 at whatever sub the writer
+# landed on — which is why the reader takes them all. Re-measured per-sub after
+# the change below: a click written on hw:Loopback,0,1 came back on
+# hw:Loopback,1,1 bit-exact, peak 30000 of a 30000-sample impulse.
 # Device 0's capture is fed by device 1's playback, which nothing writes, so an
 # idle mic reads silence like a device with no mic input instead of echoing the
 # app's own output back at it; audio_feed.sh writes that device 1 playback to
 # put real signal on a capture the app has open. Moving default to device 1
 # plugs the app into a dead cable: full-rate clock-locked digital silence.
 #
-# WHY PLAYBACK IS MIXED, NOT DIRECT. snd-aloop hands out a NEW substream for
-# every stream a client opens, so an app with two output streams — GrainBrick
-# keeps an always-on monitor stream next to its audio worker — lands on sub0 and
-# sub1, and a capture pinned to one of them hears only that one. That is how
-# "the app outputs pure silence" happened while it was playing on the other
-# sub: the silent stream was the one being read. dmix is ALSA's software mixer:
-# every client shares ONE hardware substream, so there is exactly one cable to
-# read, it exists from the moment the card does, and nothing has to be
-# discovered, followed or re-selected while music is playing. `plug` in front
-# converts whatever a client asks for (mono, 44.1k, whatever) into that mix.
+# WHY PLAYBACK IS NOT MIXED. It was dmix here, deliberately, to get one static
+# cable instead of hunting substreams at runtime — and measured, dmix was the
+# whole of the "enormous delay that will not clear" report. GrainBrick opens
+# ALSA twice: the audible worker pipes into `aplay`, and pygame/SDL2 holds a
+# second stream that it opens at startup and never writes a frame to. dmix puts
+# every client on one hardware substream and refuses to mix past the SLOWEST
+# client's position, so that idle stream pins the mix where it started. After 35
+# hours the shared slave's hw_ptr had run 6.0e9 frames ahead while its appl_ptr
+# was still 0 — the mixer had mixed nothing since before the app started — and a
+# click written through `default` reached the cable as nine seconds of exact
+# zeros: accepted, buffered, never mixed out. The backlog sits in the guest's
+# mixer ring, where the Mac-side drop cannot reach it, so the delay never comes
+# back on its own. A direct stream has no shared position to wait for:
+# each client owns a substream, and a client that never writes can only stall
+# its own silence.
 #
-# WHY default IS `asym` AND NOT JUST THE MIXER: dmix is playback-only, so making
-# it `default` outright would make `arecord -D default` fail to open at all.
-# asym keeps capture exactly as it has always been here (device 0's capture —
-# the cable nothing writes, i.e. the mic) and mixes only the playback direction.
-pcm.knulli-vm-out {
-    type dmix
-    # Every client must land in the SAME mixer: per-uid key derivation would
-    # hand root and the app separate mixers writing the same hardware substream,
-    # which is worse than useless — one silently wins and the other is silence.
-    ipc_key 4249001
-    ipc_key_add_uid false
-    slave {
-        pcm { type hw; card Loopback; device 0; subdevice 0 }
-        format S16_LE
-        rate 48000
-        channels 2
-        # 1024/4096 = 21ms/85ms at 48k. This ring is the price of static
-        # wiring: it is REAL added latency (a few tens of ms) in front of the
-        # arecord/ssh/audioplay chain, and it is the first knob to turn if the
-        # instrument feels late. No XRUNs were seen at this size with the app's
-        # monitor stream plus two mixing clients (tools/audio_static_mix_test.sh
-        # prints any), but lower it honestly: the ring belongs to whoever opens
-        # the mixer first (the app's monitor stream), so a new size only takes
-        # effect when the app restarts, and it needs another no-XRUN run after.
-        period_size 1024
-        buffer_size 4096
-    }
-}
+# Dropping the mixer costs the single cable — snd-aloop gives every client its
+# own sub again — and audio_capture.sh pays for it by holding the capture end of
+# every substream it can, permanently, and summing them. Static wiring, as
+# before, one wire per sub instead of one shared mixer.
+#
+# WHY default IS `asym`: capture stays exactly as it has always been here
+# (device 0's capture — the cable nothing writes, i.e. the mic) and only the
+# playback direction is routed to the loopback.
 pcm.!default {
     type asym
     playback.pcm {
+        # No subdevice: ALSA hands the client the next free substream and the
+        # reader takes whatever sub that was.
+        #
+        # No period_size/buffer_size here either — `snd_pcm_slave_conf` rejects
+        # them outright ("Unknown field period_size", audio open error: Invalid
+        # argument, for every client), and unlike a dmix slave there is no ring
+        # of ours to size: the buffer now belongs to whoever opens the stream, so
+        # the latency knob is the client's own -B/-F (GrainBrick's aplay asks, and
+        # the reader asks too). What the writer actually negotiated is visible at
+        # /proc/asound/card2/pcm0p/subN/hw_params if the instrument ever feels
+        # late — and left to itself aplay asks for 24000 frames (500 ms), which is
+        # why usr/local/bin/aplay (brick_aplay.sh) exists: it gives a caller that
+        # named no size a 20 ms buffer. Measured on one clock at both ends, a click
+        # 2 s into a file reached the Mac-side reader 627 ms late with aplay's
+        # default and 202 ms with a 20 ms buffer.
         type plug
-        slave.pcm "knulli-vm-out"
+        slave {
+            pcm { type hw; card Loopback; device 0 }
+            format S16_LE
+            rate 48000
+            channels 2
+        }
     }
     capture.pcm {
         type plug
@@ -180,11 +188,11 @@ pcm.!default {
             channels 2
         }
     }
-    hint { show true description "knulli-vm out to Mac (dmix)" }
+    hint { show true description "knulli-vm out to Mac (one substream per client)" }
 }
 ctl.!default { type hw; card Loopback }
 EOF
-echo "alsa default -> dmix mix on card 'Loopback' device 0 (one cable) in $R/etc/asound.conf"
+echo "alsa default -> card 'Loopback' device 0, one substream per client, in $R/etc/asound.conf"
 
 # --- the built-in mic's mixer ------------------------------------------------
 # configure_builtin_mic() shells amixer for three Allwinner codec elements
@@ -201,6 +209,18 @@ if [ -f "$HERE/brick_amixer.sh" ]; then
     echo "amixer shim -> $R/usr/local/bin/amixer (real one still at usr/bin/amixer)"
 else
     echo "WARNING: brick_amixer.sh not found next to setup_audio.sh — the mic path will report AMIXER FAILED" >&2
+fi
+
+# --- the output buffer's size -------------------------------------------------
+# Same trick for the same reason as above: the app's audible path is `aplay`, and
+# an aplay that names no buffer size gets its own 500 ms default, which on a
+# direct hardware stream IS the output latency. See brick_aplay.sh for numbers.
+if [ -f "$HERE/brick_aplay.sh" ]; then
+    $SUDO mkdir -p "$R/usr/local/bin"
+    $SUDO install -m 755 "$HERE/brick_aplay.sh" "$R/usr/local/bin/aplay"
+    echo "aplay shim -> $R/usr/local/bin/aplay (real one still at usr/bin/aplay)"
+else
+    echo "WARNING: brick_aplay.sh not found next to setup_audio.sh — output keeps aplay's 500 ms buffer" >&2
 fi
 
 # --- describe the emulated USB card -----------------------------------------

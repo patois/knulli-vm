@@ -31,7 +31,32 @@ while IFS='=' read -r kn vv; do
     [ -n "$kn" ] && export "$kn=$vv"
 done < <(grep -E '^[A-Z_]+=' "$CONF")
 
-gexec() { limactl shell "$VM" -- bash -lc "$1"; }
+# ---- how this CLI reaches the guest --------------------------------------------
+# `limactl shell` is the documented way in, and it has one failure mode that must
+# never be the tool's: it prepends `cd <whichever Mac folder you were in>` INSIDE
+# the guest, over the virtiofs share, and that share can wedge — one FUSE request
+# that never answers leaves every process touching it in D state (unkillable), and
+# the mount then answers nothing even after a lazy umount and remount. Every
+# knulli-vm command then hangs on that cd forever, including the ones that would
+# have fixed it: the one tool that has to stay reachable cannot reach the VM. Raw
+# ssh to the same guest — Lima's own ssh.config, same key, same port — never cd's
+# into the share, so it answers anyway. ControlPath=none keeps every connection
+# its own, so restarting one pipe cannot take the others down with it (that self
+# inflicted silence has happened). `limactl shell` stays as the fallback for an
+# install with no ssh.config.
+GTRANSPORT=""
+gtransport() {
+    [ -n "$GTRANSPORT" ] && return
+    if [ -f "$HOME/.lima/$VM/ssh.config" ]; then
+        GTRANSPORT="ssh -F $HOME/.lima/$VM/ssh.config -o ControlPath=none -o BatchMode=yes -o ConnectTimeout=10 lima-$VM"
+    else
+        GTRANSPORT="limactl shell $VM --"
+    fi
+}
+# printf %q because ssh joins its arguments with spaces and lets the GUEST shell
+# re-split them: a command containing quotes has to arrive quoted for a shell that
+# is not this one. (Same hazard enc() exists for.)
+gexec() { gtransport; $GTRANSPORT bash -lc "$(printf '%q' "$1")"; }
 appconf() { echo "$STATE/$VM.apps/$1"; }
 
 default_app() {
@@ -179,8 +204,7 @@ cmd_app_add() {
         # staged through stdin (the deploy loop's proven pattern) — ssh joins
         # extra argv with spaces and the remote shell re-splits them, so a
         # path with spaces must never travel as an argument
-        limactl shell "$VM" -- bash -lc \
-            "mkdir -p \$HOME/knulli-ports; install -m 644 /dev/stdin \$HOME/knulli-ports/.stub-sh" \
+        gexec "mkdir -p \$HOME/knulli-ports; install -m 644 /dev/stdin \$HOME/knulli-ports/.stub-sh" \
             < "$stub" || die "failed to stage the launcher stub"
         gexec "set -e; sudo install -m 755 \$HOME/knulli-ports/.stub-sh '$rstub'; \\
                rm -f \$HOME/knulli-ports/.stub-sh" \
@@ -453,7 +477,7 @@ cmd_input() {
 cmd_screenshot() {
     local out="${1:-knulli-vm-shot.png}"
     gexec "DISPLAY=:1 import -window root /tmp/knv-shot.png" && \
-    limactl shell "$VM" -- cat /tmp/knv-shot.png > "$out" && echo "wrote $out"
+    gexec "cat /tmp/knv-shot.png" > "$out" && echo "wrote $out"
 }
 
 # ---- audio -----------------------------------------------------------------
@@ -462,6 +486,24 @@ cmd_screenshot() {
 # end over ssh into a tiny CoreAudio player on the Mac.
 AUDIO_PIDF="$STATE/audio.$VM.pid"
 AUDIO_BIN="$HERE/bin/audioplay"
+AUDIO_SH="$STATE/audio.$VM.sh"
+# The two long-lived pipelines (this one and the feeds) live in a GENERATED host
+# script rather than inside a `nohup bash -c "..."` string, because that string is
+# parsed by a second shell and eats one layer of quoting. Measured, the string
+# form shipped the guest `bash -lc sudo /path/audio_capture.sh ...` — quotes
+# already consumed — which the guest read as "run sudo with no command": two pages
+# of sudo usage in the capture log, audioplay at EOF, the Mac silent, and
+# `audio status` saying "not streaming" with no error anywhere a user would look.
+# A file is parsed once, and `cat state/<vm>.audio.sh` shows what really runs.
+# gremote — one command, quoted for the GUEST shell, to sit inside a generated
+# host script. ssh joins its arguments with spaces and lets the guest re-parse
+# the result, so quoting that one shell has already consumed is worth nothing:
+# writing `bash -lc %q` into a file leaves `bash -lc sudo\ /path/foo`, the file's
+# own parse eats that backslash, and the guest receives `bash -lc sudo /path/foo`
+# = "run sudo with no command" (two pages of sudo usage, a silent Mac, and no
+# error anywhere a user would look). The double quotes here are what survive:
+# inside them the escapes stay literal, reach ssh intact, and are parsed GUEST-side.
+gremote() { printf 'bash -lc "%s"' "$(printf '%q' "$1")"; }
 
 audio_running() {
     local p; p=$(cat "$AUDIO_PIDF" 2>/dev/null) || return 1
@@ -486,35 +528,74 @@ cmd_audio() {
                 xcrun swiftc -O -o "$AUDIO_BIN" "$HERE/lib/host/audioplay.swift" \
                     || die "audioplay build failed (need xcrun swiftc: xcode-select --install)"
             fi
-            # audio_capture.sh (guest, as root) reads ONE fixed cable: the
-            # chroot's default mixes every playback client through dmix onto a
-            # single aloop substream (setup_audio.sh), so there is nothing to
-            # discover and nothing to re-select mid-note. An earlier version
-            # picked a substream at run time and then followed the audio; with
-            # the app's always-on silent monitor stream that meant the Mac could
-            # be wired to silence while real audio played elsewhere, and the
-            # follow itself put a gap in the middle of playback.
-            # -B/-F are microseconds: 100 ms buffer / 25 ms periods keeps the
-            # loopback->ssh pipe flowing in small quanta (low latency) while
-            # staying far above the app's ~21 ms DSP blocks (no xruns).
+            # audio_capture.sh (guest, as root) holds the capture end of EVERY
+            # output substream on the loopback card and sums them, so there is
+            # nothing to discover and nothing to re-select mid-note. It used to
+            # read one cable, because the chroot's default mixed all clients onto
+            # one substream through dmix — and that mixer was the "enormous delay
+            # that will not clear": dmix will not mix past its slowest client, and
+            # the app holds one stream it never writes to, which pinned the mix
+            # for 35 hours (setup_audio.sh has the measurement). Wiring every sub
+            # keeps the property the mixer was bought for — static, never hunting
+            # for the audio mid-note, never wired to silence while the audio plays
+            # elsewhere — without sharing a position anyone can stall.
+            # The reader's own -B/-F (20 ms / 5 ms, in audio_capture.sh) are
+            # latency, not slack: that stream is already clocked at 48 kHz, so
+            # whatever this buffer holds is simply delivered late. The other half
+            # of the same number is the WRITER's buffer — aplay's own 500 ms
+            # default, capped by brick_aplay.sh. Both measurements are written up
+            # in setup_audio.sh.
             # stderr is appended to a log, never discarded: a pipe that cannot
             # open its cable otherwise fails as silence.
-            # bash -lc on the guest so ~ expands THERE (limactl's exec
-            # form spawns no guest shell; host-side $HOME would leak in)
-            nohup bash -c "limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_capture.sh 2>>~/knulli-vm-logs/audio_capture.log' | '$AUDIO_BIN' 48000 2" \
-                >/dev/null 2>&1 &
+            # bash -lc on the guest so ~ expands THERE (the exec form spawns no
+            # guest shell; host-side $HOME would leak in)
+            gtransport
+            cat > "$AUDIO_SH" <<EOF
+#!/bin/bash
+# generated by knulli-vm audio start — safe to edit by hand to experiment; 'audio
+# stop' and 'audio start' rewrite it. Guest stderr lands in this log: a pipe that
+# cannot open its cable otherwise fails as silence. (No backticks in here: an
+# unquoted heredoc runs them.)
+exec 2>>"$STATE/$VM.audio.log"
+$GTRANSPORT $(gremote 'sudo ~/knulli-vm/audio_capture.sh') | "$AUDIO_BIN" 48000 2
+EOF
+            chmod +x "$AUDIO_SH"
+            # </dev/null: without it the pipe inherits the terminal's stdin and
+            # keeps it open for its whole life, so `audio start` never really
+            # detaches (it looks hung in any caller that waits for its children).
+            nohup "$AUDIO_SH" </dev/null >/dev/null 2>&1 &
             echo $! > "$AUDIO_PIDF"
-            echo "audio: guest loopback -> Mac speakers (pid $!)"
+            echo "audio: guest loopback -> Mac speakers (pid $!, log $STATE/$VM.audio.log)"
+            # THE INPUTS COME UP WITH THE OUTPUT, and stay up. Neither fake capture
+            # device has hardware behind it, so an input that is only wired when
+            # someone remembers to wire it is an input that records exact zeros —
+            # and the app re-opens a fresh capture stream for every take and flips
+            # freely between BUILT-IN MIC and USB AUDIO (both read out of the
+            # binary), so "wired at the moment the user pressed record" is exactly
+            # the guarantee a one-shot feed cannot give. audio_feed.sh's supervisor
+            # holds the wire and follows the sub; this brings it up.
+            # GB_FEEDS="mic" trims the list, GB_FEEDS=off skips it: the USB feed
+            # taps the Mac's OWN audio, which needs an awake display (see cmd_feed)
+            # and re-hears the guest's output playing on this Mac.
+            local f
+            for f in ${GB_FEEDS:-mic usb}; do
+                case "$f" in mic|usb) ;; *) echo "  (GB_FEEDS: ignoring '$f', use mic|usb|off)"; continue;; esac
+                feed_running "$f" && { echo "  feed $f: already wired"; continue; }
+                (cmd_feed "$f") || echo "  (feed $f could not start — knulli-vm feed $f)"
+            done
             ;;
         stop)
             if audio_running; then killtree "$(cat "$AUDIO_PIDF")"; fi
             rm -f "$AUDIO_PIDF"
             # bracket trick: the pattern must not match this very ssh cmdline.
-            # Any sub, not just ,0: a stale reader anywhere on the card is
-            # invisible from the Mac. The .py pattern exists only to clear a
-            # follower process left running from before the cable was fixed; it
-            # respawned its own arecord, so it had to die too.
-            gexec 'sudo pkill -f "audio_capture[.]py" 2>/dev/null; sudo pkill -f "arecord -D hw:Loopback[,].1," 2>/dev/null; true'
+            # Kill the mixer BEFORE its arecords — the mixer respawns a held
+            # cable's reader, so a reader killed first just comes back. The
+            # patterns match by ARGUMENT ORDER on purpose: the reader's arecords
+            # start "-f S16_LE -r 48000", while the app's own recording takes open
+            # "-D hw:0,0" first, so stopping our pipe cannot interrupt a take.
+            # The .py pattern only clears a follower left over from before the
+            # cables were fixed; it respawned its own arecord, so it had to die too.
+            gexec 'sudo pkill -f "audio_capture[.]py" 2>/dev/null; sudo pkill -f "python3 -u - [0-9]" 2>/dev/null; sleep 0.3; sudo pkill -f "ar[e]cord -f S16_LE -r 48000" 2>/dev/null; true'
             ;;
         status)
             audio_running && echo "streaming (pid $(cat "$AUDIO_PIDF"))" || echo "not streaming";;
@@ -580,12 +661,19 @@ cmd_feed() {
             # sub 0 and skip the injector's wait (nothing to discover yet —
             # and audiocap's queue only holds 0.75 s, so waiting blind just
             # drops the head of the feed).
-            local probe rate ch psub wait=20 subopt=""
+            local probe rate ch psub
             probe=$(gexec "~/knulli-vm/audio_feed.sh $target --probe 2>/dev/null")
             read -r rate ch psub <<< "$probe"
             case "$rate" in ''|*[!0-9]*) rate=48000;; esac
             case "$ch"  in ''|*[!0-9]*) ch=$([ "$target" = usb ] && echo 2 || echo 1);; esac
-            if [ -z "$psub" ] || [ "$psub" = "-" ]; then wait=0; else subopt="--sub $psub"; fi
+            # The sub the probe found is printed for the human and deliberately NOT
+            # handed on as --sub. A pinned sub turns audio_feed.sh's follower off
+            # (and blocks its loop), and the app opens a NEW capture stream for
+            # every take, flipping between mic and USB in the same session: a pinned
+            # feed then keeps writing the sub the first take used while the app
+            # records a different one — exact silence, reported as "running". That
+            # is the whole "mic works, USB does not" class. Nothing here decides
+            # where the app's next take lands; the supervisor follows it.
 
             # Re-amp warning: 'system' captures EVERYTHING the Mac plays —
             # including audioplay rendering the guest's own output, so the app
@@ -595,28 +683,101 @@ cmd_feed() {
             fi
 
             local logf; logf="$(feed_logf "$target")"
-            # The whole pipeline in one nohup'd bash: audiocap's stdout IS the
+            # A `system` feed dies with the display: ScreenCaptureKit taps system
+            # audio THROUGH an active display, so the moment the monitor naps the
+            # stream stops with -3815 "Failed to find any displays" — measured
+            # twice today, and the whole reason "mic works but usb input does not"
+            # on a Mac whose display sleeps. Hold a display assertion for exactly
+            # as long as the feed lives: it is a child of this wrapper, so
+            # `feed stop`'s killtree takes it down with the pipeline and nothing
+            # keeps the screen awake once the feed is gone.
+            local caf=""
+            if [ "$source" = system ]; then
+                # WAKE in the outer script and wait there; HOLD inside the wrapper.
+                # Both halves were learned by breaking them:
+                #  * `caffeinate -d` prevents display sleep but does NOT wake a
+                #    napped display; `-u -t N` does (measured 0 -> 1 active).
+                #  * the wake lands ~2.5 s after caffeinate starts, on a Mac whose
+                #    display re-sleeps seconds after the assertion goes away.
+                #  * the wait must NOT be inside the wrapper: the health check
+                #    below looks for the audiocap child ONE second after launch, so
+                #    a wrapper that sleeps first reported every feed as "the Mac
+                #    capture is not running" and killed it — awake display or not.
+                caffeinate -u -t 10 >/dev/null 2>&1 &
+                sleep 3.5
+                # -t 86400 is a formality: this caffeinate is a child of the
+                # wrapper, so `feed stop`'s killtree ends it with the feed and
+                # nothing keeps the screen on afterwards.
+                caf='caffeinate -d -t 86400 & CAF=$!; trap '"'"'kill $CAF 2>/dev/null'"'"' EXIT; '
+                echo "feed $target: keeping the display awake while this feed runs (caffeinate -d)"
+            fi
+            # The whole pipeline in one nohup'd script: audiocap's stdout IS the
             # ssh stdin. Killing this pid (killtree) closes the pipe; the
             # guest's aplay then sees EOF and exits, so no orphan holds the
             # loopback (the ghost class that once faked "silent app" for hours).
-            nohup bash -c "'$FEED_BIN' '$source' '$rate' '$ch' ${secs:+--secs '$secs'} \
-                | limactl shell '$VM' -- bash -lc 'sudo ~/knulli-vm/audio_feed.sh $target --wait $wait $subopt'" \
-                </dev/null >"$logf" 2>&1 &
+            # Generated as a file, not a `bash -c` string — see AUDIO_SH.
+            gtransport
+            local fsh="$STATE/feed.$VM.$target.sh"
+            cat > "$fsh" <<EOF
+#!/bin/bash
+# generated by knulli-vm feed $target — rewritten on every start. This is the
+# file to read when a feed is silent: it shows the exact command, and the log it
+# appends its own stderr to below.
+exec 2>>"$logf"
+$caf# The Mac's capturer is the fragile half of this wire. ScreenCaptureKit exits
+# with -3805 "application connection being interrupted" when the display it is
+# tapping goes away, and a feed that dies quietly is indistinguishable from a
+# broken app — which is precisely what it was reported as. So the pair is
+# restarted, not mourned. The guest supervisor exits as soon as its stdin closes
+# (audio_feed.sh), so every attempt starts both halves clean.
+n=0
+while :; do
+    # \$n stays literal: the generating shell runs under set -u, so an
+    # unescaped arithmetic expansion of it here is an "unbound variable" abort in
+    # the MIDDLE of the heredoc — which leaves a truncated (0-byte) wrapper behind
+    # and every feed thereafter "fails" with no command in it at all. (And no
+    # backticks anywhere in here: an unquoted heredoc RUNS them.)
+    [ \$((++n)) -gt 1 ] && echo "feed $target: the Mac capture ended, restarting (attempt \$n)"
+    "$FEED_BIN" '$source' '$rate' '$ch' ${secs:+--secs '$secs'} | $GTRANSPORT $(gremote "sudo ~/knulli-vm/audio_feed.sh $target --wait 0")
+    [ -n '$secs' ] && break
+    sleep 1
+done
+EOF
+            chmod +x "$fsh"
+            nohup "$fsh" </dev/null >/dev/null 2>&1 &
             local pid=$!
             echo "$pid" > "$(feed_pidf "$target")"
-            # Permission failures (Microphone / Screen Recording) kill it in
-            # the first second with the fix spelled out — surface that now
-            # instead of reporting a feed that is silently dead.
+            # Permission failures (Microphone / Screen Recording) and a missing
+            # ACTIVE DISPLAY kill the capturer in its first second with the fix
+            # spelled out — and the wrapper pid proves nothing about that. The
+            # pipeline is `bash -c 'audiocap | ssh … audio_feed.sh'`, and when
+            # audiocap dies instantly the guest half keeps running through its
+            # whole discovery wait, so `kill -0 $pid` is true and `feed` cheerfully
+            # reported a feed writing nothing. That is precisely how "USB input
+            # records only silence" looked healthy. Require the CAPTURER to be
+            # alive as a child of the pipe, not just the pipe itself.
             sleep 1
-            if ! kill -0 "$pid" 2>/dev/null; then
-                echo "feed $target: failed to start:"
+            if ! kill -0 "$pid" 2>/dev/null || ! pgrep -P "$pid" -x audiocap >/dev/null 2>&1; then
+                echo "feed $target: the Mac capture is not running — nothing will be recorded:"
                 sed 's/^/  /' "$logf" 2>/dev/null | tail -12
+                # Do not leave the guest injector parked on the cable, holding the
+                # substream and writing silence that looks like a broken app.
+                killtree "$pid" 2>/dev/null
+                gexec "sudo pkill -f 'audio_feed[.]sh $target' 2>/dev/null; sudo pkill -f 'aplay -D hw:$([ "$target" = usb ] && echo USBAudio || echo Codec),1,' 2>/dev/null; true"
                 rm -f "$(feed_pidf "$target")"
-                [ "$source" = mic ] && echo "  (System Settings > Privacy & Security > Microphone — enable your TERMINAL app)"
-                [ "$source" = system ] && echo "  (System Settings > Privacy & Security > Screen Recording — enable your TERMINAL app, then relaunch it)"
+                # Only claim PERMISSION when the log actually says permission: a
+                # no-active-display failure prints the right remedy already, and a
+                # "go grant Screen Recording" line under it sends the user to fix
+                # something that is not broken.
+                if grep -qi 'screen recording' "$logf" 2>/dev/null; then
+                    echo "  (System Settings > Privacy & Security > Screen Recording — enable your TERMINAL app, then relaunch it)"
+                elif [ "$source" = mic ]; then
+                    echo "  (Microphone: System Settings > Privacy & Security > Microphone — enable your TERMINAL app)"
+                    echo "  (no input device at all: System Settings > Sound > Input)"
+                fi
                 exit 1
             fi
-            echo "feed $target: Mac $source -> $target (${rate}Hz/${ch}ch, guest sub ${psub:-0} ${subopt:+matched}${subopt:- blind}, pid $pid)"
+            echo "feed $target: Mac $source -> $target (${rate}Hz/${ch}ch, wired permanently, follows the app's capture sub${psub:+ — on $psub now}, pid $pid)"
             echo "  log: $logf   stop: knulli-vm feed stop $target"
             ;;
         stop)
@@ -665,7 +826,7 @@ cmd_sync() {
     # directory-driven, same policy as install.sh: ship everything in
     # lib/guest/, fail on the first bad copy
     for f in "$HERE"/lib/guest/*; do
-        limactl shell "$VM" -- bash -lc "install -m 755 /dev/stdin ~/knulli-vm/$(basename "$f")" < "$f" \
+        gexec "install -m 755 /dev/stdin ~/knulli-vm/$(basename "$f")" < "$f" \
             || die "failed to deploy lib/guest/$(basename "$f")"
     done
     echo "guest scripts synced"
@@ -681,9 +842,12 @@ cmd_up() {
     # hold ssh at "Connection refused" for tens of seconds (same trap as
     # install.sh step 1). Don't report up until a command lands.
     local t=0
-    until limactl shell "$VM" -- true 2>/dev/null; do
-        sleep 2; t=$((t + 2))
-        [ "$t" -ge 120 ] && die "VM '$VM' booted but ssh never answered (limactl shell $VM)"
+    # Re-decide the transport on every pass: the ssh.config this CLI would use is
+    # written by limactl during start, so the first probes may have to be limactl's.
+    GTRANSPORT=""
+    until gexec true 2>/dev/null; do
+        sleep 2; t=$((t + 2)); GTRANSPORT=""
+        [ "$t" -ge 120 ] && die "VM '$VM' booted but ssh never answered (ssh lima-$VM / limactl shell $VM)"
     done
     echo "VM '$VM' up"
 }

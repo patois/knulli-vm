@@ -12,7 +12,14 @@
 //   system  what the Mac is PLAYING. There is no built-in system-audio tap in
 //           CoreAudio, and the alternatives all mean installing a virtual
 //           audio driver; the screen-capture input has carried system audio
-//           since macOS 12.3, so that is where this comes from.
+//           since macOS 12.3, so that is where this comes from — which means it
+//           needs an ACTIVE DISPLAY, because the tap hangs off a display. A
+//           closed lid or a sleeping monitor leaves none: measured on such a
+//           session, 2 displays were ONLINE and 0 ACTIVE, ScreenCaptureKit's
+//           display list came back EMPTY while its 119 windows and 28 apps
+//           enumerated fine and the permission preflight said TRUE. So a
+//           headless-looking Mac fails here for a reason nothing else reports,
+//           and it must be checked on its own or it reads as a dead cable.
 //
 // Neither source touches a USB device: it is all CoreAudio on the Mac's own
 // hardware. A USB audio interface plugged into the Mac is reachable only as
@@ -71,6 +78,23 @@ if source == "system" {
           the terminal. Then: knulli-vm feed usb --source system
         """, 3)
     }
+    // Permission granted is NOT enough: the tap needs a display that is driving
+    // a desktop. CoreGraphics answers that question directly, and it is the
+    // only layer here that does — ScreenCaptureKit returns an empty display
+    // list with no error at all, which is why this check sits before it.
+    var online: UInt32 = 0, active: UInt32 = 0
+    CGGetOnlineDisplayList(0, nil, &online)
+    CGGetActiveDisplayList(0, nil, &active)
+    if active == 0 {
+        die("""
+        no ACTIVE display (\(online) online, \(active) active) — 'system' audio is
+        tapped through a display, and none is driving a desktop right now: the
+        lid is closed or the display is asleep.
+          Wake or connect a display, then: knulli-vm feed usb
+          Or put the Mac's MICROPHONE on the same app input, which needs no
+          display at all:  knulli-vm feed usb --source mic
+        """, 4)
+    }
 }
 
 // --- output target -----------------------------------------------------------
@@ -90,6 +114,35 @@ var pendingBytes = 0
 let lock = NSLock()
 let wake = NSCondition()
 var delivered = 0.0, droppedBytes = 0
+
+// --- stall watchdog ----------------------------------------------------------
+// A feed that stops delivering does not fail, it goes SILENT, and silence is the
+// one thing the app cannot tell from a quiet room: the guest injector keeps the
+// loopback substream open, so the app records digital zeros forever. Measured
+// 2026-11-06 with both inputs dead at once — the `system` tap went quiet when the
+// display fell asleep (SCStream stops delivering and, with delegate:nil, never
+// says so) and the long-running mic engine had been through an audio-topology
+// change overnight. Neither was visible in `feed status`, which said "running".
+//
+// So: if the SOURCE stops handing us buffers, exit loudly. Buffer ARRIVAL is the
+// signal, not level — a silent room still delivers buffers, so this cannot fire
+// on quietness. Dying closes stdout, which EOFs the guest injector's stdin, which
+// releases the cable instead of feeding zeros through it.
+var lastDelivery = Date()
+let stallLock = NSLock()
+let stallLimit = Double(ProcessInfo.processInfo.environment["AUDIOCAP_STALL_SECS"] ?? "10") ?? 10
+
+Thread {
+    guard stallLimit > 0 else { return }
+    while true {
+        Thread.sleep(forTimeInterval: min(1.0, stallLimit / 4))
+        stallLock.lock(); let since = Date().timeIntervalSince(lastDelivery); stallLock.unlock()
+        if since > stallLimit {
+            die("no audio from the Mac for \(String(format: "%.1f", since))s (limit \(Int(stallLimit))s)"
+                + " — the \(source) capture stalled; \(source == "system" ? "did the display go to sleep?" : "is the input device still there?")")
+        }
+    }
+}.start()
 
 func enqueue(_ d: Data) {
     lock.lock()
@@ -140,6 +193,8 @@ final class Sink {
     init(_ t: AVAudioFormat) { target = t }
 
     func push(_ buf: AVAudioPCMBuffer) {
+        // Proof of life for the stall watchdog — arrival, not level.
+        stallLock.lock(); lastDelivery = Date(); stallLock.unlock()
         let src = buf.format
         if conv == nil || convSrc?.sampleRate != src.sampleRate
             || convSrc?.channelCount != src.channelCount
@@ -216,9 +271,10 @@ func runMic() -> Never {
 // headers), while ScreenCaptureKit exposes the whole audio configuration. The
 // CMSampleBuffers SCStream hands back are converted in place below.
 //
-// Screen Recording permission gates it (checked in the preflight above); a
-// denial surfaces here as the getWithCompletionHandler error, which is the
-// message that actually names the failing call.
+// Screen Recording permission gates it, and an active display gates it too —
+// both are preflighted above, so a display list that is still empty here means
+// the desktop changed under us (display unplugged or slept between the check
+// and this call), which is what the message below says.
 func runSystem() -> Never {
     let sem = DispatchSemaphore(value: 0)
     var content: SCShareableContent?
@@ -232,23 +288,78 @@ func runSystem() -> Never {
     if let e = failure {
         die("shareable content failed (Screen Recording permission?): \(e.localizedDescription)")
     }
-    guard let display = content?.displays.first else { die("no display to capture audio from") }
+    // System audio is tapped THROUGH a display, so with more than one display up
+    // `first` is a guess about which desktop you meant. (Retracted theory: this
+    // override was first written to test "you hear the captured display's own
+    // speakers" — tapping the DELL while the Mac played through the internal
+    // speakers. The zeros that prompted it were the exclusion flag below, not
+    // the display; rerouting the output to the DELL changed nothing either. Kept
+    // because choosing the display is still legitimate, and because the error
+    // path now lists what is available.)
+    let wanted = ProcessInfo.processInfo.environment["AUDIOCAP_DISPLAY"].flatMap(Int.init)
+    let displays = content?.displays ?? []
+    let picked: SCDisplay?
+    if let w = wanted {
+        picked = displays.first { Int($0.displayID) == w }
+        if picked == nil {
+            die("""
+            no display with id \(w) to capture audio from. Available: \
+            \(displays.map { "\($0.displayID) (\($0.width)x\($0.height))" }.joined(separator: ", "))
+            """, 4)
+        }
+    } else {
+        picked = displays.first
+    }
+    guard let display = picked else {
+        die("""
+        ScreenCaptureKit listed no display although CoreGraphics reported an
+        active one — the display went away (slept or unplugged) a moment ago.
+        Wake it and retry: knulli-vm feed usb
+        """, 4)
+    }
 
     let cfg = SCStreamConfiguration()
     cfg.capturesAudio = true
     cfg.sampleRate = Int(rate)          // Int in the Swift overlay, not CMTimeScale
     cfg.channelCount = channels
     cfg.queueDepth = 8
-    // Excludes only THIS process's audio (audiocap plays nothing); the guest's
-    // returned output comes from audioplay, a different process, so the app
-    // CAN hear itself re-amped. knulli-vm feed warns rather than filtering it.
-    if #available(macOS 14.0, *) { cfg.excludesCurrentProcessAudio = true }
+    // NOT set, deliberately, on any macOS. (Re-amping is unaffected either way:
+    // the guest's returned audio is played by audioplay, a different process, so
+    // the app can hear itself regardless.) It used to default to true here on
+    // the reasoning that audiocap plays nothing so excluding its own audio is
+    // free; on macOS 26.6 that flag is what made the whole feed silent — a 440 Hz
+    // tone came through as 979200 bytes of exact zeros with it set, and as a
+    // clean 440 Hz tone (rms 7751) with it cleared. Correctly-shaped, correctly
+    // sized, all-zero buffers and no error anywhere. AUDIOCAP_EXCLUDE_SELF=1
+    // re-enables it for experiments; the scope of the exclusion on this macOS is
+    // unresolved (one run showed low-level non-zero content with it set), which
+    // is exactly why the shipped path does not touch it.
+    if #available(macOS 14.0, *) {
+        cfg.excludesCurrentProcessAudio =
+            ProcessInfo.processInfo.environment["AUDIOCAP_EXCLUDE_SELF"] == "1"
+    }
 
+    // SCStream holds its stream outputs WEAKLY, and ARC releases a local at its
+    // last use even in a function that never returns — so neither the sink nor
+    // the stream can be a plain local here. Built inline as an argument, the sink
+    // died at the end of the addStreamOutput call: startCapture succeeded and
+    // then delivered NOTHING, no error and no callback ("held out 0.0s"), and the
+    // guest cable read pure silence that looks exactly like a dead app. The mic
+    // path never had this problem because installTap's closure captures its state.
+    // Measured both ways: process-held -> 312 buffers in 6 s, inline -> 0.
+    //
+    // Built before the stream because it is also the stream's DELEGATE: with
+    // delegate:nil, `didStopWithError` (display asleep, stream torn down under us)
+    // was silently dropped and the feed just went quiet. Same sink object for
+    // both roles, both held by the globals below.
+    let output = CaptureSink(sink)
     let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
-                          configuration: cfg, delegate: nil)
+                          configuration: cfg, delegate: output)
     let q = DispatchQueue(label: "audiocap.system")
+    systemStreamHolder = stream
+    systemOutputHolder = output
     do {
-        try stream.addStreamOutput(CaptureSink(sink), type: .audio, sampleHandlerQueue: q)
+        try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: q)
     } catch { die("cannot attach an audio stream output: \(error.localizedDescription)") }
 
     let startSem = DispatchSemaphore(value: 0)
@@ -264,19 +375,64 @@ func runSystem() -> Never {
     exit(0)
 }
 
+// Process-lifetime anchors for the system path — see runSystem's comment. Globals
+// because the only lifetime this pair can trust is the process's: SCStream keeps
+// outputs weakly, and the stream itself has no other owner once startCapture
+// returns into a runloop that never ends.
+var systemStreamHolder: SCStream?
+var systemOutputHolder: CaptureSink?
+
 // SCStream's sample-buffer delegate: CMSampleBuffer -> AVAudioPCMBuffer ->
 // the shared Sink, which does the S16LE/rate/channel work.
-final class CaptureSink: NSObject, SCStreamOutput {
+// AUDIOCAP_DEBUG: count non-zero bytes in a raw region. "held out Ns of audio"
+// counts frames, so it reads the same for real signal and for digital silence —
+// this is what separates "the source was silent" from "we dropped it".
+func nonzeroBytes(_ p: UnsafeMutableRawPointer?, _ n: Int) -> Int {
+    guard let p else { return -1 }
+    var c = 0
+    for i in 0..<n where p.load(fromByteOffset: i, as: UInt8.self) != 0 { c += 1 }
+    return c
+}
+
+final class CaptureSink: NSObject, SCStreamOutput, SCStreamDelegate {
     let sink: Sink
     init(_ s: Sink) { sink = s }
 
+    // The stream is telling us it is over. Say so and go: an exited audiocap
+    // closes stdout, the guest injector's stdin EOFs, and the loopback substream
+    // is released rather than held open over a river of zeros.
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let e = error as NSError
+        die("capture stopped: \(e.domain) \(e.code) — \(error.localizedDescription)")
+    }
+
+    var seen = 0
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        // AUDIOCAP_DEBUG=1: prove whether SCStream is calling at all, and which
+        // guard eats the buffer if it is. "held out 0.0s" cannot tell the two
+        // apart, and that ambiguity cost a full round of this investigation.
+        let dbg = ProcessInfo.processInfo.environment["AUDIOCAP_DEBUG"] != nil
+        if dbg {
+            seen += 1
+            if seen <= 3 {
+                log("debug: callback #\(seen) type=\(type.rawValue) samples=\(CMSampleBufferGetNumSamples(sb))"
+                    + " fmt=\(sb.formatDescription != nil)")
+            }
+        }
         guard type == .audio, let fd = sb.formatDescription else { return }
         // Non-optional in this SDK's overlay (it can't fail — it just wraps
         // the CASSBD, validity shows up when the buffer is built).
         let src = AVAudioFormat(cmAudioFormatDescription: fd)
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sb))
-        guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: src, frameCapacity: frames) else { return }
+        if dbg {
+            log("debug: src sr=\(src.sampleRate) ch=\(src.channelCount)"
+                + " common=\(src.commonFormat.rawValue) interleaved=\(src.isInterleaved)"
+                + " frames=\(frames)")
+        }
+        guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: src, frameCapacity: frames) else {
+            if dbg { log("debug: REJECT at buffer creation (frames=\(frames))") }
+            return
+        }
         // Two-call dance (the Swift overlay returns the OSStatus, not a
         // pointer): first call asks for the size, second fills our storage.
         var size = 0
@@ -284,34 +440,73 @@ final class CaptureSink: NSObject, SCStreamOutput {
             sb, bufferListSizeNeededOut: &size, bufferListOut: nil, bufferListSize: 0,
             blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: nil,
             flags: 0, blockBufferOut: nil)
-        guard size > 0 else { return }
+        if dbg, seen <= 3 { log("debug: bufferList size needed = \(size)") }
+        guard size > 0 else {
+            if dbg { log("debug: REJECT, size==0 (no AudioBufferList space reported)") }
+            return
+        }
         let storage = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
         defer { storage.deallocate() }
+        // The block buffer is REQUIRED here, not optional: the AudioBufferList's
+        // data pointers address memory inside it, so with a non-NULL
+        // bufferListOut and a NULL blockBufferOut there is nowhere to hand back
+        // the owner of that memory, and the call fails with
+        // kCMSampleBufferError_RequiredParameterMissing (-12731) while still
+        // reporting a perfectly good size on the query call above.
+        var blockBuffer: CMBlockBuffer?
         let st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sb, bufferListSizeNeededOut: nil,
             bufferListOut: storage.assumingMemoryBound(to: AudioBufferList.self),
             bufferListSize: size,
             blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: nil,
-            flags: 0, blockBufferOut: nil)
-        guard st == noErr else { return }
-        let abl = storage.assumingMemoryBound(to: AudioBufferList.self)
-        // Both lists were built from the same format description, so copying
-        // buffer-by-buffer is layout-correct for interleaved and planar alike.
-        buf.frameLength = frames
-        let dst = buf.mutableAudioBufferList
-        let n = min(Int(abl.pointee.mNumberBuffers), Int(dst.pointee.mNumberBuffers))
-        // mBuffers imports as a single AudioBuffer (the C array's first
-        // element), so it cannot be indexed dynamically — take its offset and
-        // index from there (the standard AudioBufferList idiom).
-        let off = MemoryLayout<AudioBufferList>.offset(of: \AudioBufferList.mBuffers)!
-        let sbuf = UnsafeMutableRawPointer(abl).advanced(by: off)
-                                .assumingMemoryBound(to: AudioBuffer.self)
-        let dbuf = UnsafeMutableRawPointer(dst).advanced(by: off)
-                                .assumingMemoryBound(to: AudioBuffer.self)
-        for i in 0..<n {
-            let s = sbuf[i], d = dbuf[i]
-            let bytes = Int(min(s.mDataByteSize, d.mDataByteSize))
-            if let sp = s.mData, let dp = d.mData { memcpy(dp, sp, bytes) }
+            flags: 0, blockBufferOut: &blockBuffer)
+        if dbg, seen <= 3 { log("debug: fill call OSStatus = \(st) (\(st == noErr ? "noErr" : "FAILED"))") }
+        guard st == noErr else {
+            if dbg { log("debug: REJECT, AudioBufferList fill failed") }
+            return
+        }
+        // withExtendedLifetime, not nothing: ARC releases a local at its last
+        // use, and the block buffer's last use is the fill call above — so
+        // without this it is freed before the copy below reads through those
+        // pointers. Same class of trap as the stream output (systemOutputHolder).
+        withExtendedLifetime(blockBuffer) {
+            let abl = storage.assumingMemoryBound(to: AudioBufferList.self)
+            // Both lists were built from the same format description, so copying
+            // buffer-by-buffer is layout-correct for interleaved and planar alike.
+            buf.frameLength = frames
+            let dst = buf.mutableAudioBufferList
+            let n = min(Int(abl.pointee.mNumberBuffers), Int(dst.pointee.mNumberBuffers))
+            // mBuffers imports as a single AudioBuffer (the C array's first
+            // element), so it cannot be indexed dynamically — take its offset and
+            // index from there (the standard AudioBufferList idiom).
+            let off = MemoryLayout<AudioBufferList>.offset(of: \AudioBufferList.mBuffers)!
+            let sbuf = UnsafeMutableRawPointer(abl).advanced(by: off)
+                                    .assumingMemoryBound(to: AudioBuffer.self)
+            let dbuf = UnsafeMutableRawPointer(dst).advanced(by: off)
+                                    .assumingMemoryBound(to: AudioBuffer.self)
+            if dbg, seen <= 2 {
+                var t = "debug: src bufs=\(abl.pointee.mNumberBuffers)"
+                for i in 0..<min(Int(abl.pointee.mNumberBuffers), 3) {
+                    let s = sbuf[i]
+                    t += " [\(i)] \(s.mDataByteSize)B nz=\(nonzeroBytes(s.mData, Int(min(s.mDataByteSize, 4096))))"
+                }
+                log(t)
+                log("debug: dst fmt=\(buf.format.description.replacingOccurrences(of: "\n", with: " "))"
+                    + " bufs=\(dst.pointee.mNumberBuffers) copied=\(n)")
+            }
+            for i in 0..<n {
+                let s = sbuf[i], d = dbuf[i]
+                let bytes = Int(min(s.mDataByteSize, d.mDataByteSize))
+                if let sp = s.mData, let dp = d.mData { memcpy(dp, sp, bytes) }
+            }
+            if dbg, seen <= 2 {
+                var t = "debug: after copy"
+                for i in 0..<min(Int(dst.pointee.mNumberBuffers), 3) {
+                    let x = dbuf[i]
+                    t += " [\(i)] \(x.mDataByteSize)B nz=\(nonzeroBytes(x.mData, Int(min(x.mDataByteSize, 4096))))"
+                }
+                log(t)
+            }
         }
         sink.push(buf)
     }

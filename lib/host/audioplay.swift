@@ -47,12 +47,15 @@ player.play()
 // come back down after a stall — a policy that only ever waits can get slower
 // over a session but never faster.
 //
-// TARGET is 2 chunks: enough that one late read cannot glitch the render clock,
-// small enough to stay out of the player's way. CEILING is what a hiccup costs
-// before it is discarded rather than absorbed.
-let chunkFrames = AVAudioFrameCount(rate / 40)          // 25 ms
-let target = 2.0 * Double(chunkFrames) / rate           // ~50 ms
-let ceiling = max(0.15, 2 * target)
+// TARGET is 3 chunks: enough that one late read (an ssh burst) cannot glitch
+// the render clock, small enough to stay out of the player's way. It was 2
+// chunks of 25 ms = 50 ms; with the writer now capped at 21 ms and the reader
+// at 10 ms blocks, 3 chunks of 10 ms = 30 ms holds the same one-stall margin
+// for 20 ms less. CEILING is what a hiccup costs before it is discarded
+// rather than absorbed.
+let chunkFrames = AVAudioFrameCount(rate / 100)         // 10 ms
+let target = 3.0 * Double(chunkFrames) / rate           // ~30 ms
+let ceiling = max(0.08, 3 * target)
 let stdinHandle = FileHandle.standardInput
 let debug = ProcessInfo.processInfo.environment["AUDIOPLAY_DEBUG"] != nil
 // Queue depth measured, not inferred: a buffer's completion handler fires when

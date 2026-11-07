@@ -217,15 +217,22 @@ input). If you hear nothing: `./knulli-vm audio status`, then
 ./knulli-vm feed status  # knulli-vm feed stop [usb|mic|all]
 ```
 
-Three things to know:
+Four things to know:
 
 1. **Grant the permission to your terminal app**, not to a binary — System
    Settings → Privacy & Security → **Microphone** (for `mic`) and → **Screen
    Recording** (for `usb`). The first `feed` fails with the exact fix printed if
    it's missing; after ticking Screen Recording you must relaunch the terminal.
-2. **Start the feed first, then press record in the app.** A feed whose stream
+2. **`feed usb` needs a display that is actually on.** macOS taps the Mac's
+   system audio *through a display*, so a closed lid or a sleeping monitor
+   leaves nothing to tap — having Screen Recording granted does not help. Wake
+   or connect a display and run it again (`feed` says so when this is the
+   problem). If the display sleeps *during* a take the feed stops and says why —
+   run `feed usb` again; it will not quietly record silence. `feed usb --source
+   mic` needs no display at all.
+3. **Start the feed first, then press record in the app.** A feed whose stream
    is parked is normal, not hung — it flows the moment the app opens the input.
-3. `feed usb` captures *everything* the Mac plays, including the app's own
+4. `feed usb` captures *everything* the Mac plays, including the app's own
    output coming back out of the Mac's speakers, so you can hear yourself
    re-amped. `feed usb --source mic` avoids that.
 

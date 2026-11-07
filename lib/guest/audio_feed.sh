@@ -35,6 +35,7 @@ SUDO=sudo
 
 TARGET="${1:?usage: audio_feed.sh <usb|mic> [flags]}"; shift
 MODE=stdin WAV="" SECS=0 WANT_SUB="" PROBE=0 WAIT="${FEED_WAIT:-20}"
+FEED_FAST=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --tone) MODE=tone; shift;;
@@ -88,6 +89,11 @@ pick_sub() {
         esac
     done
     [ -n "$opened" ] && { echo "${opened%% *}"; return; }
+    # FAST: the supervisor asks this many times a second, and the motion probe
+    # below sleeps 0.2 s per substream (1.6 s over eight) — fine for a one-shot
+    # discovery, far too slow to notice the app opening a stream. "Nothing is
+    # open" is the complete answer in that case.
+    [ -n "$FEED_FAST" ] && { echo ""; return; }
     for s in "$PCM"/sub*; do
         [ -r "$s/status" ] || continue
         a=$(awk '/hw_ptr/{print $3}' "$s/status" 2>/dev/null); [ -n "$a" ] || continue
@@ -138,15 +144,18 @@ DEST="hw:$CARD_ID,$PLAY_DEV,$SUB"
 # something reads the far end; point aplay at a cable nobody is capturing and it
 # blocks INSIDE write(), and since the duration is counted in frames WRITTEN,
 # the counter never advances either (`--secs 2` did not end a stream that had
-# been blocked for minutes). What really happens is more useful than what was
-# claimed: the feed parks, holding the substream, and flows the instant the app
-# opens the capture end. That is why the documented order is "start the feed,
-# THEN press record" — the parked feed is waiting for you, it is not a hang.
-# Cleaning up a feed nobody wanted is `knulli-vm feed stop` (and cmd_stop's
-# sweep), never a duration that can't be reached.
+# been blocked for minutes).
+#
+# That is why a feed that just sits there holding a dead cable is a BUG and not
+# a parked valve: aplay stopped consuming, so the ssh channel filled, so the
+# Mac's capture blocked, and every byte it queued came out late — input-side
+# delay that never comes back, and a cable writing to a sub the app is not
+# holding, which reads as pure silence with the feed reporting "running". Both
+# of those were reported by users as "recording does not work". See supervise().
 DUR=()
 [ "$SECS" -gt 0 ] && DUR=(-d "$SECS")
-play() { $SUDO aplay -D "$DEST" -f "$FMT" -r "$RATE" -c "$CH" -t raw -q -B 100000 -F 25000 "${DUR[@]}"; }
+play() { $SUDO aplay -D "hw:$CARD_ID,$PLAY_DEV,$1" -f "$FMT" -r "$RATE" -c "$CH" -t raw -q \
+                   -B 100000 -F 25000 "${DUR[@]}"; }
 
 # A loud swept tone with a slow amplitude wobble: unmistakable on a scope, on
 # the app's live waveform, and in a recorded file's RMS.
@@ -196,10 +205,94 @@ except BrokenPipeError:
 '
 }
 
+# --- the wire stays up: follow the app's capture substream ------------------
+# Why this exists. GrainBrick does NOT hold an input open. It spawns a fresh
+# `arecord` for every take (AudioRecorder.start; stop sends SIGINT so the WAV
+# header gets written), and it re-resolves its USB device by name immediately
+# before each capture ("USB device is resolved immediately before capture, so
+# device numbers can change across KNULLI devices" — read out of the binary). It
+# also flips freely between BUILT-IN MIC and USB AUDIO in the same session, and
+# aplay/arecord on a loopback card get whatever substream is free at that
+# moment. So a feed that picks a substream once, at startup, is wrong by
+# construction: the second take lands on another sub, the feed keeps writing
+# the first one, and the app records exact zeros while `feed status` says
+# running. That is the whole class of "mic works, USB doesn't" reports.
+#
+# So the feed is a supervisor, not a one-shot:
+#   * nothing recording          -> drain the bytes into /dev/null. The Mac's
+#                                   capture must never block on us; a blocked
+#                                   ssh channel is input-side delay that is
+#                                   never given back.
+#   * the app holds a capture sub -> write THIS card's paired playback sub.
+#   * the sub changed, or aplay died -> respawn against the new sub, re-reading
+#                                   hw_params (the app sets rate/channels per
+#                                   source: mic is mono, USB is stereo).
+# `--sub N` still means "pin it there" — that is how you feed a stream that is
+# open but not yet started, and it disables the follow.
+sync_params() {
+    local s=$1 r c f
+    r=$(hp rate "$s"); c=$(hp channels "$s"); f=$(hp format "$s")
+    [ -n "$r" ] && RATE=$r
+    [ -n "$c" ] && CH=$c
+    [ -n "$f" ] && FMT=$f
+}
+
+supervise() {
+    local prev="" pid="" want dies=0
+    FEED_FAST=1
+    while :; do
+        want=$(pick_sub)
+        [ -n "$WANT_SUB" ] && want="$WANT_SUB"
+        if [ "$want" = "$prev" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            sleep 0.2; continue
+        fi
+        [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=""; }
+        # A writer that dies on the sub we just chose (the paired playback sub
+        # held by a stale feed, say) must not turn this into a 5 Hz respawn loop
+        # of the same error — back off, but keep trying, because the stale
+        # holder may be on its way out.
+        if [ "$want" = "$prev" ]; then dies=$((dies+1)); else dies=0; fi
+        [ "$dies" -ge 3 ] && sleep 0.5
+        # `<&0` IS THE WHOLE FEED. An asynchronous command in a non-interactive
+        # shell gets /dev/null for stdin before any explicit redirection — POSIX,
+        # and bash obeys it — so `play 0 &` started aplay with an instant EOF: it
+        # opened the cable, wrote nothing, exited 0, and the supervisor respawned
+        # it twice a second, printing "recording on capture sub 0" every time while
+        # the app recorded exact zeros. That is this script's own version of the
+        # bug it exists to fix, and `feed status` could not see it: the supervisor
+        # WAS alive, its child simply never had any bytes. `cat > /dev/null &` was
+        # wrong the same way — it drained nothing and exited at once, so the drain
+        # branch spun too and the Mac's capture blocked on a pipe nobody read.
+        if [ -n "$want" ]; then
+            sync_params "$want"
+            echo "audio_feed: $TARGET recording on capture sub $want -> writing playback sub $want (${RATE}Hz/$CH/$FMT)" >&2
+            play "$want" <&0 &
+        else
+            [ -n "$prev" ] && echo "audio_feed: $TARGET stopped recording; draining (bytes discarded, wire kept live)" >&2
+            cat > /dev/null <&0 &
+            pid=$!; prev="$want"
+            # If the drain child dies at once, stdin is at EOF — the host stopped
+            # feeding us. Its capturer does die: ScreenCaptureKit exits with -3805
+            # "application connection being interrupted" when the display it taps
+            # goes away. Spinning on a closed pipe would keep `feed status`
+            # reporting a live feed that can only ever write silence, which is the
+            # lie this script exists to prevent. Say so and let the host wrapper
+            # restart the pair.
+            sleep 0.3
+            kill -0 "$pid" 2>/dev/null && continue
+            echo "audio_feed: $TARGET: the host feed ended (stdin closed) — exiting" >&2
+            exit 1
+        fi
+        pid=$!; prev="$want"
+        # An explicit --sub is a pin: nothing to follow, just keep it alive.
+        [ -n "$WANT_SUB" ] && { wait "$pid" 2>/dev/null; pid=""; prev=""; }
+    done
+}
+
 case "$MODE" in
-    tone) tone | play;;
+    tone) tone | play "$SUB";;
     # aplay understands WAV itself, but only if the file already matches the
     # capture's channels — so convert first and keep one raw path.
-    wav)  wav_to_raw | play;;
-    stdin) cat | play;;
+    wav)  wav_to_raw | play "$SUB";;
+    stdin) supervise;;
 esac
