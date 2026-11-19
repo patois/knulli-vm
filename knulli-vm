@@ -12,6 +12,7 @@ has_quote() { case "$1" in *"'"*) return 0;; *) return 1;; esac; }
 # launch commands quote their own arguments; base64 is the only encoding
 # whose output cannot be re-split or re-quoted on the way to the guest.
 enc() { printf %s "$1" | base64 | tr -d '\n'; }
+. "$HERE/lib/host/zip_layout.sh"   # vendor-zip layout detection (see that file)
 
 # ---- selection & config -----------------------------------------------------
 VM=""
@@ -100,33 +101,18 @@ cmd_app_add() {
     esac
     [ -e "$src" ] || die "app source not found: $src"
 
-    # unpack zips; find the app root. A single top-level directory wins even
-    # when loose *.sh launcher companions sit next to it (GrainBrick's zip:
-    # "GrainBrick beta 1.0.1.sh" + "grainbrick beta 1.0.1/") — those .sh files
-    # are the launcher stubs KNULLI's EmulationStation runs on the device.
-    #
-    # Install the vendor's layout VERBATIM, name and all. Those stubs hardcode
-    # their own app dir (GrainBrick 1.0.1's is APP='/userdata/roms/ports/
-    # grainbrick beta 1.0.1') and the stub is what creates samples/, projects/
-    # and recordings/ and seeds them from demo-samples/ and demo-projects/ on
-    # first run. Renaming the directory to something shell-friendly — the old
-    # `tr ' ' '-'` — pointed the stub at a path that does not exist, so we
-    # skipped the stub and shipped users an empty sample browser the device
-    # would never show them. Keep the name; carry it safely instead (DIR/CMD
-    # reach the guest base64-encoded, so spaces cannot break the quoting).
+    # unpack zips; find the app root and the vendor's launcher stub beside it.
+    # zip_layout installs the vendor's layout VERBATIM, name and all, because
+    # the stubs hardcode their own app dir (/userdata/roms/ports/<name>) and
+    # the stub is what does first-run seeding — its rationale is in
+    # lib/host/zip_layout.sh, its cases in tools/ziplayout_selftest.sh.
     local root stub=""
     if [ -d "$src" ]; then root="$src"
     elif unzip -l "$src" >/dev/null 2>&1; then
         local u="$HERE/downloads/unpacked/$(basename "${src%.zip}")"
         [ -d "$u" ] || { mkdir -p "$u"; unzip -q "$src" -d "$u"; }
-        local n nsh
-        n=$(find "$u" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-        nsh=$(find "$u" -mindepth 1 -maxdepth 1 -type f ! -name '*.sh' | wc -l | tr -d ' ')
-        if [ "$n" = 1 ] && [ "$nsh" = 0 ]; then
-            root=$(find "$u" -mindepth 1 -maxdepth 1 -type d)
-            # the sibling stub a device would install next to the app dir
-            stub=$(find "$u" -mindepth 1 -maxdepth 1 -type f -name '*.sh' | head -1)
-        else root="$u"; fi
+        zip_layout "$u"
+        root="$ZIP_ROOT"; stub="$ZIP_STUB"
     else die "unsupported app source (want .zip or directory): $src"; fi
 
     [ -n "$name" ] || name=$(basename "$root")
